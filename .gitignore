@@ -1,20 +1,29 @@
-# 忽略数据文件夹
-data/
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
 
-# 忽略常见数据文件
-*.zip
-*.csv
-*.tsv
-*.npy
-
-# 忽略日志和缓存
-*.log
-*.tmp
+# Python cache
 __pycache__/
+*.py[cod]
+*$py.class
 
-runs/
-checkpoint/
+# PyTorch model files
+*.pth
+*.pt
+
+# Logs
 *.log
-runs/
-checkpoint/
-*.log
+logs/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
