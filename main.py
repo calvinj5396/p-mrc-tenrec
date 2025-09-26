@@ -365,7 +365,8 @@ if __name__ == "__main__":
     # parser.add_argument('--save_path', type=str, default='/data/home')
     parser.add_argument('--task', type=int, default=-1)
     parser.add_argument('--valid_rate', type=int, default=100)
-
+    # 在parser.add_argument行列表中添加这一行
+    parser.add_argument('--local-rank', type=int, default=0, help='Local rank for distributed training')
     parser.add_argument('--model_name', default='')
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--re_epochs', type=int, default=20)
@@ -374,7 +375,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--device', default='cuda')  # cuda:0
     parser.add_argument('--is_parallel', type=bool, default=False)
-    parser.add_argument('--local_rank', type=int)
+    #parser.add_argument('--local_rank', type=int)
     parser.add_argument('--num_gpu', type=int, default=1)
     parser.add_argument('--weight_decay', type=float, default=0.0, help='l2 regularization') #0.008
     parser.add_argument('--decay_step', type=int, default=5, help='Decay step for StepLR')
@@ -477,9 +478,27 @@ if __name__ == "__main__":
     parser.add_argument('--ch', type=bool, default=True)
 
     args = parser.parse_args()
+    # 在这里添加GPU检查代码
+    import torch
+    print(f"可用GPU数量: {torch.cuda.device_count()}")
+    print(f"当前设备: {torch.cuda.current_device()}")
+    
+    # 检查分布式训练设置
+    if torch.distributed.is_initialized():
+        print(f"分布式训练已初始化")
+        print(f"World size: {torch.distributed.get_world_size()}")
+        print(f"Local rank: {torch.distributed.get_rank()}")
+    else:
+        print("分布式训练未初始化")
     if args.is_parallel:
-        torch.distributed.init_process_group(backend="nccl")
-        torch.cuda.set_device(args.local_rank)
+        if 'RANK' not in os.environ:
+            # DataParallel模式
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            # DistributedDataParallel模式
+            torch.distributed.init_process_group(backend="nccl")
+            torch.cuda.set_device(args.local_rank)
+            device = torch.device(f'cuda:{args.local_rank}')
     device = torch.device(args.device)
     # if 'bert' in args.model_name:
     set_seed(args.seed)
