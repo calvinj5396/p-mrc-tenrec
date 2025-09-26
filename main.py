@@ -490,16 +490,14 @@ if __name__ == "__main__":
         print(f"Local rank: {torch.distributed.get_rank()}")
     else:
         print("分布式训练未初始化")
-    if args.is_parallel:
-        if 'RANK' not in os.environ:
-            # DataParallel模式
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        else:
-            # DistributedDataParallel模式
-            torch.distributed.init_process_group(backend="nccl")
-            torch.cuda.set_device(args.local_rank)
-            device = torch.device(f'cuda:{args.local_rank}')
-    device = torch.device(args.device)
+    # 新代码
+    if args.is_parallel and torch.cuda.device_count() > 1:
+        device = torch.device('cuda')
+        args.device = 'cuda'
+        print(f"使用DataParallel模式，检测到 {torch.cuda.device_count()} 个GPU")
+    else:
+        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+        args.device = device
     # if 'bert' in args.model_name:
     set_seed(args.seed)
     writer = SummaryWriter()
@@ -534,8 +532,8 @@ if __name__ == "__main__":
             metrics = Sequence_full_Validate(0, model, test_loader, writer, args, test=False)
             # print('inference_time:', model.all_time)
         writer.close()
+    # 新代码
     elif args.task_name == 'mtl':
-
         train_dataloader, val_dataloader, test_dataloader, user_feature_dict, item_feature_dict = get_data(args)
         if args.mtl_task_num == 2:
             num_task = 2
@@ -544,8 +542,18 @@ if __name__ == "__main__":
         if args.model_name == 'esmm':
             model = ESMM(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, num_task=num_task)
         else:
-            model = MMOE(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, device=args.device, num_task=num_task)
-        mtlTrain(model, train_dataloader, val_dataloader, test_dataloader, args, train=False)
+            # 注意这里device参数应该传'cpu'，因为模型会先在CPU创建
+            model = MMOE(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, device='cpu', num_task=num_task)
+        
+        # 先将模型移到GPU
+        model = model.to(args.device)
+        
+        # 如果启用并行且有多个GPU，包装为DataParallel
+        if args.is_parallel and torch.cuda.device_count() > 1:
+            model = torch.nn.DataParallel(model)
+            print(f"MMOE模型已启用DataParallel，使用 {torch.cuda.device_count()} 个GPU")
+        
+        mtlTrain(model, train_dataloader, val_dataloader, test_dataloader, args, train=True)
     elif args.task_name == 'transfer_learning':
         print('=============transfer_learning=============')
         train_loader, val_loader, test_loader = get_data(args) #, user_noclick
