@@ -12,3 +12,9 @@ data/
 *.tmp
 __pycache__/
 
+runs/
+checkpoint/
+*.log
+runs/
+checkpoint/
+*.log
