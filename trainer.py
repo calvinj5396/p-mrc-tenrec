@@ -56,19 +56,29 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 cograd_step([task1_shared, task2_shared],
                             shared_params,
                             gammas=[args.gamma1, args.gamma2])   # γ 超参见下
+                # 添加内存释放代码
+                for tg in [task1_shared, task2_shared]:
+                    for grad in tg.values():
+                        del grad
 
                 # ④ task-specific 塔的梯度——不动共享层
-                for p in shared_params:               # 暂时冻结共享层反向图
-                    p.requires_grad_(False)
-                optimizer.zero_grad(set_to_none=True) # 清掉 task-specific grad
-                (loss_1 + loss_2).backward()          # 只会更新塔层
                 for p in shared_params:
-                    p.requires_grad_(True)            # 恢复
+                    p.requires_grad_(False)
+                optimizer.zero_grad(set_to_none=True)
+                
+                # 重新前向传播计算损失
+                predict = model(x)
+                loss_1_new = loss_function(predict[0], y1.unsqueeze(1).float())
+                loss_2_new = loss_function(predict[1], y2.unsqueeze(1).float())
+                (loss_1_new + loss_2_new).backward()
+                
+                for p in shared_params:
+                    p.requires_grad_(True)
 
                 # ⑤ 最终更新
                 optimizer.step()
 
-                total_loss += float(loss_1 + loss_2)
+                total_loss += (loss_1 + loss_2).item()
                 count += 1
                 # -------------------- CoGrad 替换结束 --------------------
 
