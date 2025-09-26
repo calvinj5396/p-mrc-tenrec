@@ -47,7 +47,7 @@ from model.cf.ngcf import NGCF
 # from model.cf.vae import VAECF
 # from model.cf.item2vec import Item2Vec
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
 def select_sampler(train_data, val_data, test_data, user_count, item_count, args):
     if args.sample == 'random':
