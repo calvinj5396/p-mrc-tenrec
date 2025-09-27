@@ -91,7 +91,7 @@ p-mrc-tenrec/
 
 | 模型                      | Click AUC  | Like AUC   |
 |---------------------------|------------|------------|
-| MMOE baseline             | 0.7930     | 0.9095     |
+| MMOE baseline             | 0.7900     | 0.9020     |
 | + PFE + ResFlow           | 0.7942     | 0.9180     |
 | **P-MRC-MMOE (ours)**     | **0.7947** | **0.9221** |
 
