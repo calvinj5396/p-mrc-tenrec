@@ -110,6 +110,17 @@ p-mrc-tenrec/
 
 如果本项目对您的研究有帮助，请考虑引用：
 
+### 本项目
+```bibtex
+@misc{liu2025pmrcmmoe,
+  title={P-MRC-MMOE: Enhanced Multi-Task Recommendation with Prototype Feature Extraction and Gradient Conflict Resolution},
+  author={Liu, Yichen},
+  year={2025},
+  howpublished={\url{https://github.com/liuyichen/p-mrc-mmoe}}
+}
+```
+
+### 基础 MMOE 论文
 ```bibtex
 @inproceedings{ma2018mmoe,
   title={Modeling task relationships in multi-task learning with multi-gate mixture-of-experts},
