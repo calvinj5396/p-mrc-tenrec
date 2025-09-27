@@ -46,39 +46,34 @@ pip install scikit-learn tqdm pandas numpy
 ~/autodl-tmp/p-mrc-tenrec/data/Tenrec/ctr_data_1M.csv
 ---
 
-## 快速开始（DDP 两卡示例）
-> ```bash
+快速开始（DDP 两卡示例）
 torchrun --nproc_per_node=2 main.py \
---task_name mtl \
---seed 100 \
---model_name mmoe \
---dataset_path ~/autodl-tmp/p-mrc-tenrec/data/Tenrec/ctr_data_1M.csv \
---train_batch_size 4096 \
---val_batch_size 4096 \
---test_batch_size 4096 \
---epochs 20 \
---lr 0.0008 \
---embedding_size 32 \
---mtl_task_num 2 \
---gamma1 0.1 \
---gamma2 0.1 \
---is_parallel True
-* `--is_parallel True` 打开 DDP 训练  
-* 若只用单卡，可改为 `--is_parallel False`  
-* PFE / ResFlow / ADATT 可在 `main.py` 中通过 flag 启用或关闭
-> ```bash
----
-> ```bash
-## 项目结构
+  --task_name mtl \
+  --seed 100 \
+  --model_name mmoe \
+  --dataset_path ~/autodl-tmp/p-mrc-tenrec/data/Tenrec/ctr_data_1M.csv \
+  --train_batch_size 4096 \
+  --val_batch_size 4096 \
+  --test_batch_size 4096 \
+  --epochs 20 \
+  --lr 0.0008 \
+  --embedding_size 32 \
+  --mtl_task_num 2 \
+  --gamma1 0.1 \
+  --gamma2 0.1 \
+  --is_parallel True
+--is_parallel True打开 DDP 训练
+若只用单卡，可改为 --is_parallel False
+PFE / ResFlow / ADATT 可在 main.py中通过 flag 启用或关闭
+项目结构
 p-mrc-tenrec/
-├── main.py # 入口脚本（参数解析与训练启动）
-├── trainer.py # 训练循环（支持 DDP + CoGrad）
+├── main.py                 # 入口脚本（参数解析与训练启动）
+├── trainer.py              # 训练循环（支持 DDP + CoGrad）
 ├── model/
-│ └── mtl/mmoe.py # MMOE 基类与 PFE / ResFlow / ADATT 模块
-├── utils.py # DataLoader 与指标工具
-└── data/Tenrec/ # 数据集
----
-> ```bash
+│   └── mtl/mmoe.py         # MMOE 基类与 PFE / ResFlow / ADATT 模块
+├── utils.py                # DataLoader 与指标工具
+└── data/Tenrec/            # 数据集
+
 ## 训练技巧
 
 * DDP 建议保留 `find_unused_parameters=True`（模型包含分支）
