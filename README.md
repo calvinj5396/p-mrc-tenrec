@@ -47,7 +47,7 @@ pip install scikit-learn tqdm pandas numpy
 ---
 
 ## 快速开始（DDP 两卡示例）
-bash
+> ```bash
 torchrun --nproc_per_node=2 main.py \
 --task_name mtl \
 --seed 100 \
@@ -66,9 +66,9 @@ torchrun --nproc_per_node=2 main.py \
 * `--is_parallel True` 打开 DDP 训练  
 * 若只用单卡，可改为 `--is_parallel False`  
 * PFE / ResFlow / ADATT 可在 `main.py` 中通过 flag 启用或关闭
-
+> ```bash
 ---
-
+> ```bash
 ## 项目结构
 p-mrc-tenrec/
 ├── main.py # 入口脚本（参数解析与训练启动）
@@ -78,7 +78,7 @@ p-mrc-tenrec/
 ├── utils.py # DataLoader 与指标工具
 └── data/Tenrec/ # 数据集
 ---
-
+> ```bash
 ## 训练技巧
 
 * DDP 建议保留 `find_unused_parameters=True`（模型包含分支）
