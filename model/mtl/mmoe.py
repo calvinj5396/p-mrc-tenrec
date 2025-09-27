@@ -1,141 +1,233 @@
-'''
+# -*- coding: utf-8 -*-
+"""
 Reference:
-    [1]Jiaqi Ma et al. Modeling task relationships in multi-task learning with multi-gate mixture-of-experts. In Proceedings of the 24th ACM SIGKDD
-    International Conference on Knowledge Discovery & Data Mining, pages 1930–1939, 2018.
-Reference:
-    https://github.com/busesese/MultiTaskModel
-'''
+  [1] Jiaqi Ma et al. Modeling task relationships in multi-task learning with multi-gate mixture-of-experts.
+      KDD 2018.
+Notes:
+  - 集成了三项增强：
+      * PFE (Prototype Feature Enhancement)
+      * AdaTT Gate (Sigmoid gate, 支持温度 gate_tau)
+      * ResFlow (任务间残差信息流，使用两层 MLP)
+  - 保持与原始接口兼容：forward(inputs) -> List[task_logits]
+"""
+
+from typing import Dict, Tuple, List, Optional
+
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 
+# =========================
+#  Prototype Feature Layer
+# =========================
+class PFELayer(nn.Module):
+    """Prototype Feature Enhancement.
+    输入/输出形状一致：(B, in_dim)
+    """
+    def __init__(self, in_dim: int, num_proto: int = 4, temp: float = 1.0):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_proto = num_proto
+        self.temp = temp
+
+        self.centers = nn.Parameter(torch.empty(num_proto, in_dim))
+        nn.init.xavier_uniform_(self.centers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, in_dim)
+        # centers: (K, in_dim)
+        # pairwise distance (B, K)
+        dist = torch.cdist(x, self.centers, p=2)
+        w = F.softmax(-dist / self.temp, dim=1)         # (B, K)
+        z = torch.matmul(w, self.centers)               # (B, in_dim)
+        return z
+
+
+# =============
+#     MMOE
+# =============
 class MMOE(nn.Module):
     """
-    MMOE for CTCVR problem
+    MMOE for multi-task CTR/CTCVR etc.
     """
 
-    def __init__(self, user_feature_dict, item_feature_dict, emb_dim=128, n_expert=2, mmoe_hidden_dim=128,
-                 hidden_dim=[128, 128], dropouts=[0.5, 0.5], output_size=1, expert_activation=F.relu, num_task=2, device=None):
-        """
-        MMOE model input parameters
-        :param user_feature_dict: user feature dict include: {feature_name: (feature_unique_num, feature_index)}
-        :param item_feature_dict: item feature dict include: {feature_name: (feature_unique_num, feature_index)}
-        :param emb_dim: int embedding dimension
-        :param n_expert: int number of experts in mmoe
-        :param mmoe_hidden_dim: mmoe layer input dimension
-        :param hidden_dim: list task tower hidden dimension
-        :param dropouts: list of task dnn drop out probability
-        :param output_size: int task output size
-        :param expert_activation: activation function like 'relu' or 'sigmoid'
-        :param num_task: int default 2 multitask numbers
-        """
-        super(MMOE, self).__init__()
-        # check input parameters
-        if user_feature_dict is None or item_feature_dict is None:
-            raise Exception("input parameter user_feature_dict and item_feature_dict must be not None")
-        if isinstance(user_feature_dict, dict) is False or isinstance(item_feature_dict, dict) is False:
-            raise Exception("input parameter user_feature_dict and item_feature_dict must be dict")
+    def __init__(
+        self,
+        user_feature_dict: Dict[str, Tuple[int, int]],
+        item_feature_dict: Dict[str, Tuple[int, int]],
+        emb_dim: int = 128,
+        n_expert: int = 2,
+        mmoe_hidden_dim: int = 128,
+        hidden_dim: List[int] = [128, 128],
+        dropouts: List[float] = [0.5, 0.5],
+        output_size: int = 1,
+        expert_activation = F.relu,
+        num_task: int = 2,
+        # 新增开关/超参
+        use_pfe: bool = True,
+        pfe_proto_num: int = 4,
+        pfe_temp: float = 1.0,
+        use_resflow: bool = True,
+        gate_tau: float = 1.0,        # AdaTT 温度，=1 等价普通 Sigmoid
+        res_dim: Optional[int] = None # ResFlow 维度(默认= mmoe_hidden_dim)
+    ):
+        super().__init__()
+
+        if not isinstance(user_feature_dict, dict) or not isinstance(item_feature_dict, dict):
+            raise ValueError("user_feature_dict 和 item_feature_dict 必须是 dict，形如 {feat_name: (n_unique, col_idx)}")
 
         self.user_feature_dict = user_feature_dict
         self.item_feature_dict = item_feature_dict
-        self.expert_activation = expert_activation
         self.num_task = num_task
+        self.n_expert = n_expert
+        self.mmoe_hidden_dim = mmoe_hidden_dim
+        self.expert_activation = expert_activation
+        self.use_pfe = use_pfe
+        self.use_resflow = use_resflow
+        self.gate_tau = gate_tau
 
-        if device:
-            self.device = device
+        # ---------- Embedding 初始化 ----------
+        user_cate_cnt, item_cate_cnt = 0, 0
+        for name, (voc_size, _) in self.user_feature_dict.items():
+            if voc_size > 1:
+                user_cate_cnt += 1
+                setattr(self, name, nn.Embedding(voc_size, emb_dim))
+        for name, (voc_size, _) in self.item_feature_dict.items():
+            if voc_size > 1:
+                item_cate_cnt += 1
+                setattr(self, name, nn.Embedding(voc_size, emb_dim))
 
-        # embedding初始化
-        user_cate_feature_nums, item_cate_feature_nums = 0, 0
-        for user_cate, num in self.user_feature_dict.items():
-            if num[0] > 1:
-                user_cate_feature_nums += 1
-                setattr(self, user_cate, nn.Embedding(num[0], emb_dim))
-        for item_cate, num in self.item_feature_dict.items():
-            if num[0] > 1:
-                item_cate_feature_nums += 1
-                setattr(self, item_cate, nn.Embedding(num[0], emb_dim))
+        # hidden_size = cat(user_embeds, item_embeds, dense_feats)
+        hidden_size = emb_dim * (user_cate_cnt + item_cate_cnt) \
+                      + (len(self.user_feature_dict) - user_cate_cnt) \
+                      + (len(self.item_feature_dict) - item_cate_cnt)
 
-        # user embedding + item embedding
-        hidden_size = emb_dim * (user_cate_feature_nums + item_cate_feature_nums) + \
-                      (len(self.user_feature_dict) - user_cate_feature_nums) + (
-                              len(self.item_feature_dict) - item_cate_feature_nums)
+        # ---------- PFE ----------
+        if self.use_pfe:
+            self.pfe = PFELayer(in_dim=hidden_size, num_proto=pfe_proto_num, temp=pfe_temp)
 
-        # experts
-        self.experts = torch.nn.Parameter(torch.rand(hidden_size, mmoe_hidden_dim, n_expert), requires_grad=True)
-        self.experts.data.normal_(0, 1)
-        self.experts_bias = torch.nn.Parameter(torch.rand(mmoe_hidden_dim, n_expert), requires_grad=True)
-        # gates
-        self.gates = [torch.nn.Parameter(torch.rand(hidden_size, n_expert), requires_grad=True) for _ in
-                      range(num_task)]
-        for gate in self.gates:
-            gate.data.normal_(0, 1)
-        self.gates_bias = [torch.nn.Parameter(torch.rand(n_expert), requires_grad=True) for _ in range(num_task)]
+        # ---------- Experts ----------
+        # experts: (hidden_size, mmoe_hidden_dim, n_expert)
+        self.experts = nn.Parameter(torch.empty(hidden_size, mmoe_hidden_dim, n_expert))
+        nn.init.normal_(self.experts, mean=0.0, std=1.0)
+        self.experts_bias = nn.Parameter(torch.zeros(mmoe_hidden_dim, n_expert))
 
+        # ---------- Gates ----------
+        # 每个任务一个 gate 矩阵： (hidden_size, n_expert)，加一个 bias: (n_expert,)
+        self.gates = nn.ParameterList([
+            nn.Parameter(torch.empty(hidden_size, n_expert)) for _ in range(num_task)
+        ])
+        self.gates_bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(n_expert)) for _ in range(num_task)
+        ])
+        for p in self.gates:
+            nn.init.normal_(p, mean=0.0, std=1.0)
+
+        # ---------- Task Towers ----------
         for i in range(self.num_task):
-            setattr(self, 'task_{}_dnn'.format(i + 1), nn.ModuleList())
-            hid_dim = [mmoe_hidden_dim] + hidden_dim
-            for j in range(len(hid_dim) - 1):
-                getattr(self, 'task_{}_dnn'.format(i + 1)).add_module('ctr_hidden_{}'.format(j),
-                                                                      nn.Linear(hid_dim[j], hid_dim[j + 1]))
-                getattr(self, 'task_{}_dnn'.format(i + 1)).add_module('ctr_batchnorm_{}'.format(j),
-                                                                      nn.BatchNorm1d(hid_dim[j + 1]))
-                getattr(self, 'task_{}_dnn'.format(i + 1)).add_module('ctr_dropout_{}'.format(j),
-                                                                      nn.Dropout(dropouts[j]))
-            getattr(self, 'task_{}_dnn'.format(i + 1)).add_module('task_last_layer',
-                                                                  nn.Linear(hid_dim[-1], output_size))
+            tower = nn.ModuleList()
+            dims = [mmoe_hidden_dim] + list(hidden_dim)
+            for j in range(len(dims) - 1):
+                tower.add_module(f"linear_{j}", nn.Linear(dims[j], dims[j + 1]))
+                tower.add_module(f"bn_{j}", nn.BatchNorm1d(dims[j + 1]))
+                tower.add_module(f"drop_{j}", nn.Dropout(dropouts[j]))
+                tower.add_module(f"act_{j}", nn.ReLU(inplace=True))
+            tower.add_module("head", nn.Linear(dims[-1], output_size))
+            setattr(self, f"task_{i+1}_dnn", tower)
 
-    def forward(self, x):
-        assert x.size()[1] == len(self.item_feature_dict) + len(self.user_feature_dict)
-        # embedding
-        user_embed_list, item_embed_list = list(), list()
-        for user_feature, num in self.user_feature_dict.items():
-            if num[0] > 1:
-                user_embed_list.append(getattr(self, user_feature)(x[:, num[1]].long()))
+        # ---------- ResFlow ----------
+        if self.use_resflow:
+            residual_dim = res_dim or mmoe_hidden_dim
+            # 为 task2..taskK 各建一个 residual learner
+            self.res_mlps = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(residual_dim, residual_dim, bias=False),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(residual_dim, residual_dim, bias=False)
+                )
+                for _ in range(self.num_task - 1)
+            ])
+            # 可选：需要再稳定一些可以加 LayerNorm
+            # self.res_norms = nn.ModuleList([nn.LayerNorm(residual_dim) for _ in range(self.num_task - 1)])
+
+    # 组装 embedding -> (B, hidden_size)
+    def _build_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        user_embs, item_embs = [], []
+
+        # 用户侧
+        for feat, (voc_size, col) in self.user_feature_dict.items():
+            if voc_size > 1:
+                user_embs.append(getattr(self, feat)(x[:, col].long()))
             else:
-                user_embed_list.append(x[:, num[1]].unsqueeze(1))
-        for item_feature, num in self.item_feature_dict.items():
-            if num[0] > 1:
-                item_embed_list.append(getattr(self, item_feature)(x[:, num[1]].long()))
+                user_embs.append(x[:, col].unsqueeze(1))  # dense 单值特征
+
+        # 物品侧
+        for feat, (voc_size, col) in self.item_feature_dict.items():
+            if voc_size > 1:
+                item_embs.append(getattr(self, feat)(x[:, col].long()))
             else:
-                item_embed_list.append(x[:, num[1]].unsqueeze(1))
+                item_embs.append(x[:, col].unsqueeze(1))
 
-        # embedding 融合
-        user_embed = torch.cat(user_embed_list, axis=1)
-        item_embed = torch.cat(item_embed_list, axis=1)
+        user_embed = torch.cat(user_embs, dim=1) if len(user_embs) else None
+        item_embed = torch.cat(item_embs, dim=1) if len(item_embs) else None
 
-        # hidden layer
-        hidden = torch.cat([user_embed, item_embed], axis=1).float()  # batch * hidden_size
+        if user_embed is None:
+            hidden = item_embed
+        elif item_embed is None:
+            hidden = user_embed
+        else:
+            hidden = torch.cat([user_embed, item_embed], dim=1)
 
-        # mmoe
-        experts_out = torch.einsum('ij, jkl -> ikl', hidden, self.experts)  # batch * mmoe_hidden_size * num_experts
-        experts_out += self.experts_bias
+        return hidden.float()
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        # x shape: (B, num_user_feats + num_item_feats)
+        assert x.size(1) == len(self.user_feature_dict) + len(self.item_feature_dict)
+
+        # 1) Build hidden from embeddings (B, H)
+        hidden = self._build_hidden(x)
+
+        # 2) PFE (可选)
+        if self.use_pfe:
+            hidden = self.pfe(hidden)
+
+        # 3) Experts: (B, M, E)
+        experts_out = torch.einsum('ij, jkl -> ikl', hidden, self.experts)  # (B, mmoe_hidden_dim, n_expert)
+        experts_out = experts_out + self.experts_bias
         if self.expert_activation is not None:
             experts_out = self.expert_activation(experts_out)
 
-        gates_out = list()
-        for idx, gate in enumerate(self.gates):
-            gate = gate.to(self.device)
-            gate_out = torch.einsum('ab, bc -> ac', hidden, gate)  # batch * num_experts
-            if self.gates_bias:
-                self.gates_bias[idx] = self.gates_bias[idx].to(self.device)
-                gate_out += self.gates_bias[idx]
-            gate_out = nn.Softmax(dim=-1)(gate_out)
-            gates_out.append(gate_out)
+        # 4) AdaTT Gates：每个任务一套 Sigmoid 权重（支持温度）
+        fused_list: List[torch.Tensor] = []
+        for t in range(self.num_task):
+            gate_w = self.gates[t]              # (H, E)
+            gate_b = self.gates_bias[t]         # (E,)
+            # logits: (B, E)
+            logits = torch.einsum('ab, bc -> ac', hidden, gate_w) + gate_b
+            # Sigmoid + 温度（温度越小，越“硬”）
+            gate_out = torch.sigmoid(logits / self.gate_tau)        # (B, E)
+            gate_out = gate_out.unsqueeze(1)                        # (B, 1, E) for broadcast
+            fused = (experts_out * gate_out).sum(dim=2)             # (B, mmoe_hidden_dim)
+            fused_list.append(fused)
 
-        outs = list()
-        for gate_output in gates_out:
-            expanded_gate_output = torch.unsqueeze(gate_output, 1)  # batch * 1 * num_experts
-            weighted_expert_output = experts_out * expanded_gate_output.expand_as(
-                experts_out)  # batch * mmoe_hidden_size * num_experts
-            outs.append(torch.sum(weighted_expert_output, 2))  # batch * mmoe_hidden_size
-
-        # task tower
-        task_outputs = list()
+        # 5) ResFlow + 任务塔
+        task_outputs: List[torch.Tensor] = []
+        prev_h: Optional[torch.Tensor] = None
         for i in range(self.num_task):
-            x = outs[i]
-            for mod in getattr(self, 'task_{}_dnn'.format(i + 1)):
-                x = mod(x)
-            task_outputs.append(x)
+            h = fused_list[i]
+
+            if self.use_resflow and i > 0 and prev_h is not None:
+                residual = self.res_mlps[i - 1](prev_h.detach())   # 不反传上一任务梯度
+                # residual = self.res_norms[i - 1](residual)       # 如需更稳，可放开
+                h = h + residual
+
+            prev_h = h.detach()
+
+            # task-specific tower
+            tower: nn.ModuleList = getattr(self, f"task_{i+1}_dnn")
+            for mod in tower:
+                h = mod(h)
+            task_outputs.append(h)
 
         return task_outputs

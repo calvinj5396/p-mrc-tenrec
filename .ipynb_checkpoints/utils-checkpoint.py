@@ -14,6 +14,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 from model.ctr.inputs import *
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 tqdm.pandas()
 
@@ -1277,24 +1280,43 @@ class CandidatesDataset(data_utils.Dataset):
     def __getitem__(self, index):
         return torch.tensor(self.data[index][0]), torch.tensor(self.data[index][1])
 
+# utils.py
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+
+def _use_ddp():
+    return dist.is_available() and dist.is_initialized()
+
 def get_train_loader(dataset, args):
-    if args.is_parallel:
-        dataloader = data_utils.DataLoader(dataset, batch_size=args.train_batch_size, sampler=DistributedSampler(dataset))
+    if args.is_parallel and _use_ddp():
+        sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
+        return DataLoader(
+            dataset,
+            batch_size=args.train_batch_size,
+            sampler=sampler,
+            shuffle=False,         # DDP 下不要再 shuffle
+            num_workers=4,
+            pin_memory=True,
+        )
     else:
-        dataloader = data_utils.DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True, pin_memory=True)
-    return dataloader
+        return DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True, pin_memory=True)
 
 def get_val_loader(dataset, args):
-    if args.is_parallel:
-        dataloader = data_utils.DataLoader(dataset, batch_size=args.val_batch_size, sampler=DistributedSampler(dataset))
+    if args.is_parallel and _use_ddp():
+        sampler = DistributedSampler(dataset, shuffle=False, drop_last=False)
+        return DataLoader(dataset, batch_size=args.val_batch_size, sampler=sampler,
+                          shuffle=False, num_workers=4, pin_memory=True)
     else:
-        dataloader = data_utils.DataLoader(dataset, batch_size=args.val_batch_size, shuffle=False, pin_memory=True)
-    return dataloader
+        return DataLoader(dataset, batch_size=args.val_batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
 def get_test_loader(dataset, args):
-    if args.is_parallel:
-        dataloader = data_utils.DataLoader(dataset, batch_size=args.test_batch_size, sampler=DistributedSampler(dataset))
+    if args.is_parallel and _use_ddp():
+        sampler = DistributedSampler(dataset, shuffle=False, drop_last=False)
+        return DataLoader(dataset, batch_size=args.test_batch_size, sampler=sampler,
+                          shuffle=False, num_workers=4, pin_memory=True)
     else:
-        dataloader = data_utils.DataLoader(dataset, batch_size=args.test_batch_size, shuffle=False, pin_memory=True)
-    return dataloader
+        return DataLoader(dataset, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+
 

@@ -1,40 +1,71 @@
 import torch
 from typing import Sequence, Dict
+import torch.nn.functional as F
 
-def get_shared_params(model, share_keywords=("experts", "gates", "embedding")):
+def get_shared_params(model):
     """
-    按名字粗略抓取『共享参数』。也可以手动写死一个列表。
+    只收 MMOE 共享层参数（experts / experts_bias / gates / gates_bias）。
+    DDP/DataParallel 下自动取 .module。
     """
-    shared, specific = [], []
-    for n, p in model.named_parameters():
-        if any(k in n for k in share_keywords):
-            shared.append(p)
+    m = model.module if hasattr(model, "module") else model
+    names, params = [], []
+
+    # experts / experts_bias
+    if hasattr(m, "experts"):
+        names.append("experts");       params.append(m.experts)
+    if hasattr(m, "experts_bias"):
+        names.append("experts_bias");  params.append(m.experts_bias)
+
+    # gates / gates_bias: 可能是 ParameterList
+    if hasattr(m, "gates"):
+        for i, pg in enumerate(m.gates):
+            names.append(f"gates.{i}"); params.append(pg)
+    if hasattr(m, "gates_bias"):
+        for i, pb in enumerate(m.gates_bias):
+            names.append(f"gates_bias.{i}"); params.append(pb)
+
+    # 展开成单个 Parameter 列表（experts 是 3D Parameter，直接返回本体即可）
+    shared_params = []
+    for p in params:
+        if isinstance(p, (list, tuple)):
+            shared_params.extend(list(p))
         else:
-            specific.append(p)
-    return shared, specific
+            shared_params.append(p)
+
+    # 只要 requires_grad 的
+    shared_params = [p for p in shared_params if isinstance(p, torch.nn.Parameter) and p.requires_grad]
+    return shared_params, None  # spec_params 用不到，返回 None 即可
+
+
 
 
 @torch.no_grad()
-def cograd_step(task_grads: Sequence[Dict[str, torch.Tensor]],
-                shared_params: Sequence[torch.nn.Parameter],
-                gammas: Sequence[float]):
+def cograd_step(task_grads, shared_params, gammas):
     """
-    根据 CoGrad 近似公式(论文 Eq.(10)+(11)) 重新组合梯度。
-    task_grads[i][name] 是第 i 个 task 在 param[name] 上的原始梯度。
-    修改后把结果写回 param.grad，optimizer.step() 就直接用它们。
+    task_grads: List[Dict[id(param) -> grad_tensor]]
+    shared_params: List[Parameter]
+    gammas: List[float]，每个任务的 gamma
     """
     T = len(task_grads)
     for p in shared_params:
-        # 收集每个任务对该 p 的梯度
-        g = [tg[id(p)] for tg in task_grads]      # list[Tensor], 形状完全相同
-        # 先做一次浅拷贝方便计算
-        g_new = [gi.clone() for gi in g]
+        pid = id(p)
+        # 收集每个任务的梯度（允许缺失 -> 用 0 替代）
+        g = []
+        for t in range(T):
+            gt = task_grads[t].get(pid, None)
+            if gt is None:
+                gt = torch.zeros_like(p, device=p.device)
+            g.append(gt)
 
+        # 近似二阶修正
+        g_new = [gi.clone() for gi in g]
         for i in range(T):
             for j in range(T):
-                if i == j: 
+                if i == j:
                     continue
-                # Hessian 近似:  H_j g_i  ≈  (g_j ⊙ g_j ⊙ g_i)
-                g_new[i] -= gammas[j] * (g[j] * g[j] * g[i])  # 按元素乘
-        # 最终写回 —— 这里直接简单平均，也可以按 loss 权重 w_i 再乘
-        p.grad = sum(g_new) / T
+                # H_j g_i ≈ (g_j ⊙ g_j ⊙ g_i)
+                g_new[i] -= gammas[j] * (g[j] * g[j] * g[i])
+
+        # 写回共享参数的最终梯度（取平均）
+        p.grad = sum(g_new) / float(T)
+

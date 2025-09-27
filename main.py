@@ -478,26 +478,30 @@ if __name__ == "__main__":
     parser.add_argument('--ch', type=bool, default=True)
 
     args = parser.parse_args()
-    # 在这里添加GPU检查代码
-    import torch
+    import os, torch, torch.distributed as dist
+
     print(f"可用GPU数量: {torch.cuda.device_count()}")
-    print(f"当前设备: {torch.cuda.current_device()}")
+    try:
+        print(f"当前设备: {torch.cuda.current_device()}")
+    except Exception:
+        pass
     
-    # 检查分布式训练设置
-    if torch.distributed.is_initialized():
-        print(f"分布式训练已初始化")
-        print(f"World size: {torch.distributed.get_world_size()}")
-        print(f"Local rank: {torch.distributed.get_rank()}")
+    if dist.is_available() and dist.is_initialized():
+        print("分布式训练已初始化")
     else:
         print("分布式训练未初始化")
-    # 新代码
-    if args.is_parallel and torch.cuda.device_count() > 1:
-        device = torch.device('cuda')
-        args.device = 'cuda'
-        print(f"使用DataParallel模式，检测到 {torch.cuda.device_count()} 个GPU")
+    
+    # 这里只设置默认 device，不做 DP/DDP 包装
+    args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 友好提示（可留可删）
+    if args.is_parallel and 'LOCAL_RANK' in os.environ:
+        print(f"[boot] 检测到 torchrun/LOCAL_RANK={os.environ['LOCAL_RANK']}，稍后进入 DDP 初始化")
+    elif args.is_parallel and torch.cuda.device_count() > 1:
+        print(f"[boot] 检测到多卡({torch.cuda.device_count()})，若未由 torchrun 启动，将回退到 DataParallel")
     else:
-        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-        args.device = device
+        print("[boot] 单卡/CPU 模式")
+
     # if 'bert' in args.model_name:
     set_seed(args.seed)
     writer = SummaryWriter()
@@ -532,28 +536,63 @@ if __name__ == "__main__":
             metrics = Sequence_full_Validate(0, model, test_loader, writer, args, test=False)
             # print('inference_time:', model.all_time)
         writer.close()
-    # 新代码
+        # 新代码
     elif args.task_name == 'mtl':
-        train_dataloader, val_dataloader, test_dataloader, user_feature_dict, item_feature_dict = get_data(args)
-        if args.mtl_task_num == 2:
-            num_task = 2
+        import os, torch, torch.distributed as dist
+    
+        # 0) 先判断是否 DDP（必须在 get_data 之前）
+        use_ddp = args.is_parallel and ('LOCAL_RANK' in os.environ)
+        if use_ddp:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_rank)
+            args.device = torch.device(local_rank)
+            print(f"[DDP] init done. local_rank={local_rank}")
         else:
-            num_task = 1
+            args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+        # 1) 取数据（此时 utils.py 会看到 dist.is_initialized() 的状态，才能安全用 DistributedSampler）
+        train_dataloader, val_dataloader, test_dataloader, user_feature_dict, item_feature_dict = get_data(args)
+    
+        num_task = 2 if args.mtl_task_num == 2 else 1
+    
+        # 2) 先在 CPU 构建模型
         if args.model_name == 'esmm':
             model = ESMM(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, num_task=num_task)
         else:
-            # 注意这里device参数应该传'cpu'，因为模型会先在CPU创建
-            model = MMOE(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, device='cpu', num_task=num_task)
-        
-        # 先将模型移到GPU
-        model = model.to(args.device)
-        
-        # 如果启用并行且有多个GPU，包装为DataParallel
-        if args.is_parallel and torch.cuda.device_count() > 1:
+            model = MMOE(
+                user_feature_dict, item_feature_dict,
+                emb_dim=args.embedding_size,
+                num_task=num_task,
+                use_pfe=True, pfe_proto_num=8, pfe_temp=1.0,
+                use_resflow=True,
+                gate_tau=1.0,
+            )
+
+    
+        # 3) 包装：优先 DDP，其次 DP，最后单卡（不要再次 init）
+        if use_ddp:
+            model = model.to(args.device)  # args.device.index == local_rank
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[args.device.index],
+                find_unused_parameters=True,      # 关键：允许本轮存在未参与 loss 的参数
+                gradient_as_bucket_view=True      # 小优化：减少内存、加速 bucket 视图
+            )
+            print(f"[DDP] 已启用, local_rank={args.device.index}")
+        elif args.is_parallel and torch.cuda.device_count() > 1:
+            model = model.to('cuda')
             model = torch.nn.DataParallel(model)
-            print(f"MMOE模型已启用DataParallel，使用 {torch.cuda.device_count()} 个GPU")
-        
+            print(f"[DP] 已启用, 使用 {torch.cuda.device_count()} 张 GPU")
+        else:
+            model = model.to(args.device)
+    
+        # 4) 开训
         mtlTrain(model, train_dataloader, val_dataloader, test_dataloader, args, train=True)
+    
+
+
     elif args.task_name == 'transfer_learning':
         print('=============transfer_learning=============')
         train_loader, val_loader, test_loader = get_data(args) #, user_noclick
