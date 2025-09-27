@@ -38,10 +38,10 @@ pip install scikit-learn tqdm pandas numpy
 
 ## 数据集
 
-下载 [Tenrec CTR-1M 数据集](https://github.com/yuantiku/Tenrec)，解压到：
+下载 [Tenrec 数据集](https://static.qblv.qq.com/qblv/h5/algo-frontend/tenrec_dataset.html)，解压到：
 
 ```
-~/autodl-tmp/p-mrc-tenrec/data/Tenrec/ctr_data_1M.csv
+~/p-mrc-tenrec/data/
 ```
 
 ## 快速开始
@@ -53,7 +53,7 @@ torchrun --nproc_per_node=2 main.py \
   --task_name mtl \
   --seed 100 \
   --model_name mmoe \
-  --dataset_path ~/autodl-tmp/p-mrc-tenrec/data/Tenrec/ctr_data_1M.csv \
+  --dataset_path your/path/to/ctr_data_1M.csv \
   --train_batch_size 4096 \
   --val_batch_size 4096 \
   --test_batch_size 4096 \
@@ -84,17 +84,6 @@ p-mrc-tenrec/
 └── data/Tenrec/            # 数据集目录
 ```
 
-## 训练技巧
-
-- **DDP 配置**：建议保留 `find_unused_parameters=True`（模型包含分支结构）
-- **优化器分离**：使用 CoGrad 时可选将优化器拆分为 `opt_shared` + `opt_tower`，提升梯度控制稳定性
-- **进程清理**：训练验证结束后在脚本尾部调用：
-  ```python
-  if dist.is_initialized():
-      dist.barrier()
-      dist.destroy_process_group()
-  ```
-- **指标聚合**：分布式场景下验证/测试推荐在所有 rank 上运行，再用 `all_reduce` 或 `gather_object` 聚合指标
 
 ## 实验结果
 
