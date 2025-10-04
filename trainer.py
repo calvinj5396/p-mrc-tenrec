@@ -18,9 +18,7 @@ import os, torch
 import torch.distributed as dist
 from torch.nn import functional as F
 import torch
-
-
-
+from tqdm import tqdm
 
 def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
@@ -61,59 +59,70 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
             shared_params, _ = get_shared_params(model)
 
-            for step, (x, y1, y2) in enumerate(train_loader):
+            # 创建进度条 - 只在 rank0 显示
+            if is_rank0():
+                pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', 
+                           leave=True, ncols=120)
+            else:
+                pbar = train_loader
+
+            for step, (x, y1, y2) in enumerate(pbar):
                 x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
 
                 optimizer.zero_grad(set_to_none=True)
                 
                 # ======= CoGrad：DDP下禁用自动同步 =======
                 with model.no_sync() if is_dist() else contextlib.nullcontext():
-                    # 只做一次forward
                     out = model(x)
                     
-                    # 任务1 backward
                     loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
                     loss1.backward(retain_graph=True)
                     
-                    # 收集任务1梯度
                     task1_grads = {}
                     for p in shared_params:
                         if p.grad is not None:
                             task1_grads[id(p)] = p.grad.clone()
                     
-                    # 任务2 backward
                     loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
                     loss2.backward()
                     
-                    # 收集任务2梯度
                     task2_grads = {}
                     for p in shared_params:
                         if p.grad is not None:
                             task2_grads[id(p)] = p.grad.clone()
                 
-                # CoGrad修正共享参数梯度
                 cograd_step([task1_grads, task2_grads], shared_params, 
                            gammas=[args.gamma1, args.gamma2])
                 
-                # DDP手动同步共享参数梯度
                 if is_dist():
                     for p in shared_params:
                         if p.grad is not None:
                             dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                 
-                # 更新参数
                 optimizer.step()
 
-                # ======= 收集指标（不需要梯度）=======
+                # ======= 收集指标 =======
                 with torch.no_grad():
                     y1_true.extend(y1.squeeze().cpu().numpy())
                     y2_true.extend(y2.squeeze().cpu().numpy())
                     y1_pred.extend(out[0].squeeze().cpu().numpy())
                     y2_pred.extend(out[1].squeeze().cpu().numpy())
-                    total_loss += (loss1 + loss2).item()
+                    batch_loss = (loss1 + loss2).item()
+                    total_loss += batch_loss
                     count += 1
 
-            # ------- 训练日志（只 rank0 打印） -------
+                    # 更新进度条显示
+                    if is_rank0():
+                        pbar.set_postfix({
+                            'loss': f'{batch_loss:.4f}',
+                            'avg_loss': f'{total_loss/count:.4f}'
+                        })
+
+            # 关闭进度条
+            if is_rank0():
+                pbar.close()
+
+            # ------- 训练日志 -------
             if is_rank0():
                 click_auc = roc_auc_score(y1_true, y1_pred) if len(set(y1_true)) > 1 else 0.5
                 like_auc  = roc_auc_score(y2_true, y2_pred) if len(set(y2_true)) > 1 else 0.5
@@ -127,7 +136,13 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 local_cnt      = torch.tensor([0], device=device)
                 vy1_true, vy2_true, vy1_pred, vy2_pred = [], [], [], []
 
-                for x, y1, y2 in val_loader:
+                # 验证集进度条
+                if is_rank0():
+                    val_pbar = tqdm(val_loader, desc=f'Validation', leave=False, ncols=100)
+                else:
+                    val_pbar = val_loader
+
+                for x, y1, y2 in val_pbar:
                     x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
                     out = model(x)
                     loss = loss_fn(out[0], y1.unsqueeze(1).float()) + \
@@ -139,6 +154,9 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     vy2_true.extend(y2.squeeze().cpu().numpy())
                     vy1_pred.extend(out[0].squeeze().cpu().numpy())
                     vy2_pred.extend(out[1].squeeze().cpu().numpy())
+
+                if is_rank0():
+                    val_pbar.close()
 
                 # 所有 rank 聚合 val loss
                 if is_dist():
@@ -191,7 +209,13 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             local_loss_sum = torch.tensor([0.0], device=device)
             local_cnt      = torch.tensor([0], device=device)
 
-            for x, y1, y2 in test_loader:
+            # 测试集进度条
+            if is_rank0():
+                test_pbar = tqdm(test_loader, desc='Testing', ncols=100)
+            else:
+                test_pbar = test_loader
+
+            for x, y1, y2 in test_pbar:
                 x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
                 out = model(x)
                 loss = loss_fn(out[0], y1.unsqueeze(1).float()) + \
@@ -203,6 +227,9 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 ty2_true.extend(y2.squeeze().cpu().numpy())
                 ty1_pred.extend(out[0].squeeze().cpu().numpy())
                 ty2_pred.extend(out[1].squeeze().cpu().numpy())
+
+            if is_rank0():
+                test_pbar.close()
 
             if is_dist():
                 dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM)
@@ -242,8 +269,15 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
         
                 y_train_true, y_train_pred = [], []
                 total_loss, count = 0.0, 0
+
+                # 单任务训练进度条
+                if is_rank0():
+                    pbar = tqdm(train_loader, desc=f'Epoch {i+1}/{epochs}', 
+                               leave=True, ncols=120)
+                else:
+                    pbar = train_loader
         
-                for x, y in train_loader:
+                for x, y in pbar:
                     x, y = x.to(device), y.to(device)
                     pred = model(x)
                     logits = pred[0] if isinstance(pred, (list, tuple)) else pred
@@ -257,20 +291,35 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     loss.backward()
                     optimizer.step()
         
-                    total_loss += float(loss.item())
+                    batch_loss = float(loss.item())
+                    total_loss += batch_loss
                     count += 1
-        
+
+                    # 更新进度条
+                    if is_rank0():
+                        pbar.set_postfix({
+                            'loss': f'{batch_loss:.3f}',
+                            'avg_loss': f'{total_loss/count:.3f}'
+                        })
+
                 if is_rank0():
+                    pbar.close()
                     auc = roc_auc_score(y_train_true, y_train_pred) if len(set(y_train_true)) > 1 else 0.5
                     print(f"Epoch {i+1} train loss {total_loss / max(count,1):.3f}, AUC {auc:.3f}")
         
+                # 验证
                 model.eval()
                 with torch.no_grad():
                     local_loss_sum = torch.tensor([0.0], device=device)
                     local_cnt      = torch.tensor([0],   device=device)
                     y_val_true, y_val_pred = [], []
+
+                    if is_rank0():
+                        val_pbar = tqdm(val_loader, desc='Validation', leave=False, ncols=100)
+                    else:
+                        val_pbar = val_loader
         
-                    for x, y in val_loader:
+                    for x, y in val_pbar:
                         x, y = x.to(device), y.to(device)
                         pred = model(x)
                         logits = pred[0] if isinstance(pred, (list, tuple)) else pred
@@ -281,6 +330,9 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                         vloss = loss_fn(logits, y.unsqueeze(1).float())
                         local_loss_sum += vloss
                         local_cnt += 1
+
+                    if is_rank0():
+                        val_pbar.close()
         
                     if is_dist():
                         dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM)
@@ -317,6 +369,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     dist.barrier()
                 model.train()
         
+        # 测试
         state = torch.load(save_path, map_location=device)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
@@ -325,8 +378,13 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             local_loss_sum = torch.tensor([0.0], device=device)
             local_cnt      = torch.tensor([0],   device=device)
             y_test_true, y_test_pred = [], []
+
+            if is_rank0():
+                test_pbar = tqdm(test_loader, desc='Testing', ncols=100)
+            else:
+                test_pbar = test_loader
         
-            for x, y in test_loader:
+            for x, y in test_pbar:
                 x, y = x.to(device), y.to(device)
                 pred = model(x)
                 logits = pred[0] if isinstance(pred, (list, tuple)) else pred
@@ -337,6 +395,9 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 tloss = loss_fn(logits, y.unsqueeze(1).float())
                 local_loss_sum += tloss
                 local_cnt += 1
+
+            if is_rank0():
+                test_pbar.close()
         
             if is_dist():
                 dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM)
@@ -362,29 +423,6 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
-
-
-
-def Infacc_Train(epochs, b_model, p_model, train_loader, val_loader, writer, args): #, user_noclicks
-    b_optimizer = torch.optim.Adam(b_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    p_optimizer = torch.optim.Adam(p_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    b_model = b_model.to(args.device)
-    p_model = p_model.to(args.device)
-    best_metric = 0
-    for epoch in range(epochs):
-        Infacc_Trainer(epoch, b_model, p_model, train_loader, b_optimizer, p_optimizer, writer, args)
-        metrics = Infacc_Validate(epoch, b_model, p_model, val_loader, writer, args)
-
-        current_metric = metrics['NDCG@5']
-        if best_metric < current_metric:
-            best_metric = current_metric
-            p_state_dict = p_model.state_dict()
-            b_state_dict = b_model.state_dict()
-            torch.save(p_state_dict, os.path.join(args.save_path, '{}_{}_seed{}_lr{}_block{}_best_policynet.pth'.format(args.task_name, args.model_name, args.seed,
-                                                                                                                                       args.lr, args.block_num)))
-            torch.save(b_state_dict, os.path.join(args.save_path,
-                                                  '{}_{}_seed{}_lr{}_block{}_best_backbone.pth'.format(
-                                                      args.task_name, args.model_name, args.seed, args.lr, args.block_num)))
 
 def Infacc_Trainer(epoch, b_model, p_model, dataloader, b_optimizer, p_optimizer, writer, args):
     print("+" * 20, "Train Epoch {}".format(epoch + 1), "+" * 20)
