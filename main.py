@@ -698,6 +698,7 @@ if __name__ == "__main__":
                 print("⚠️  模型不支持PFE可视化（缺少 _build_hidden 或 pfe 属性）")
             else:
                 # 收集PFE分析数据
+                # 收集PFE分析数据
                 pfe_data = {
                     'routing_weights': [],
                     'features_before': [],
@@ -712,20 +713,20 @@ if __name__ == "__main__":
                             break
                             
                         x = x.to(args.device)
-                        
-                        # 获取PFE前的特征
                         hidden = raw_model._build_hidden(x)
                         
                         # 计算routing weights
                         dist_matrix = torch.cdist(hidden, raw_model.pfe.centers, p=2)
                         weights = F.softmax(-dist_matrix / raw_model.pfe.temp, dim=1)
-                        pfe_data['routing_weights'].append(weights.cpu())
                         
                         # PFE后的特征
                         enhanced = raw_model.pfe(hidden)
                         
-                        # 修正3: 动态确定batch大小
+                        # 动态确定batch大小（控制内存）
                         batch_size = min(32, hidden.size(0))
+                        
+                        # 所有数据保持一致的维度
+                        pfe_data['routing_weights'].append(weights.cpu()[:batch_size])
                         pfe_data['features_before'].append(hidden.cpu()[:batch_size])
                         pfe_data['features_after'].append(enhanced.cpu()[:batch_size])
                         pfe_data['ctr_labels'].append(y1.cpu()[:batch_size])
