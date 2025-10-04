@@ -671,11 +671,14 @@ if __name__ == "__main__":
             print(f"[DP] 已启用, 使用 {torch.cuda.device_count()} 张 GPU")
         else:
             model = model.to(args.device)
-    
-        # 4) 开训
+        ## 开训
         mtlTrain(model, train_dataloader, val_dataloader, test_dataloader, args, train=True)
+        
         # ========== PFE 可视化分析 ==========
-        if dist.get_rank() == 0 if (dist.is_available() and dist.is_initialized()) else True:​
+        # 修正1: 正确的分布式检查
+        is_rank0 = (not (dist.is_available() and dist.is_initialized())) or dist.get_rank() == 0
+        
+        if is_rank0:
             print("\n" + "="*50)
             print("  PFE Visualization Analysis")
             print("="*50)
@@ -690,24 +693,60 @@ if __name__ == "__main__":
             raw_model.load_state_dict(state)
             raw_model.eval()
             
-            # 收集PFE分析数据
-            pfe_data = {
-                'routing_weights': [],
-                'features_before': [],
-                'features_after': [],
-                'ctr_labels': [],
-                'like_labels': []
-            }
-            
-            with torch.no_grad():
-                for i, (x, y1, y2) in enumerate(test_dataloader):
-                    if i >= 50:  # 只取前50个batch避免内存爆炸
-                        break
-                        
+            # 修正2: 检查模型是否支持可视化
+            if not hasattr(raw_model, '_build_hidden') or not hasattr(raw_model, 'pfe'):
+                print("⚠️  模型不支持PFE可视化（缺少 _build_hidden 或 pfe 属性）")
+            else:
+                # 收集PFE分析数据
+                pfe_data = {
+                    'routing_weights': [],
+                    'features_before': [],
+                    'features_after': [],
+                    'ctr_labels': [],
+                    'like_labels': []
+                }
                 
-                print("\n✓ 可视化完成，图片已保存到:", args.save_path)
-    
-
+                with torch.no_grad():
+                    for i, (x, y1, y2) in enumerate(test_dataloader):
+                        if i >= 50:  # 只取前50个batch
+                            break
+                            
+                        x = x.to(args.device)
+                        
+                        # 获取PFE前的特征
+                        hidden = raw_model._build_hidden(x)
+                        
+                        # 计算routing weights
+                        dist_matrix = torch.cdist(hidden, raw_model.pfe.centers, p=2)
+                        weights = F.softmax(-dist_matrix / raw_model.pfe.temp, dim=1)
+                        pfe_data['routing_weights'].append(weights.cpu())
+                        
+                        # PFE后的特征
+                        enhanced = raw_model.pfe(hidden)
+                        
+                        # 修正3: 动态确定batch大小
+                        batch_size = min(32, hidden.size(0))
+                        pfe_data['features_before'].append(hidden.cpu()[:batch_size])
+                        pfe_data['features_after'].append(enhanced.cpu()[:batch_size])
+                        pfe_data['ctr_labels'].append(y1.cpu()[:batch_size])
+                        pfe_data['like_labels'].append(y2.cpu()[:batch_size])
+                
+                # 修正4: 检查数据是否收集成功
+                if pfe_data['routing_weights']:
+                    all_routing = torch.cat(pfe_data['routing_weights'])
+                    all_ctr = torch.cat(pfe_data['ctr_labels'])
+                    all_like = torch.cat(pfe_data['like_labels'])
+                    
+                    visualize_routing_patterns(all_routing, all_ctr, all_like, args)
+                    
+                    all_before = torch.cat(pfe_data['features_before'])
+                    all_after = torch.cat(pfe_data['features_after'])
+                    
+                    compare_feature_spaces_tsne(all_before, all_after, all_ctr, args)
+                    
+                    print("\n✓ 可视化完成，图片已保存到:", args.save_path)
+                else:
+                    print("❌ 未收集到PFE数据，请检查模型配置")
 
     elif args.task_name == 'transfer_learning':
         print('=============transfer_learning=============')
