@@ -64,7 +64,7 @@ def cograd_step(task_grads, shared_params, gammas):
                 if i == j:
                     continue
                 # H_j g_i ≈ (g_j ⊙ g_j ⊙ g_i)
-                g_new[i] -= gammas[j] * (g[j] * g[j] * g[i])
+                g_new[i] -= gammas[j] * (g[i] * g[i] * g[j])
 
         # 写回共享参数的最终梯度（取平均）
         p.grad = sum(g_new) / float(T)
