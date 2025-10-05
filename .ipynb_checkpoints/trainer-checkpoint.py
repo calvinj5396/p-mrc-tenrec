@@ -45,17 +45,20 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    
+
     # 初始化logger（只在rank0）
     logger = None
     if is_rank0():
-        logger = ResultLogger(args.save_path, args.seed)
+        try:
+            logger = ResultLogger(args.save_path, args.seed)
+        except Exception:
+            logger = None
 
     # ================= 多任务 =================
     if args.mtl_task_num == 2 and train:
         model.train()
         for epoch in range(epochs):
-            # 保证 DDP 下 shuffle 一致
+            # DDP 下保证 shuffle 一致
             if is_dist() and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
             if is_dist() and hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
@@ -64,71 +67,78 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             y1_true, y2_true, y1_pred, y2_pred = [], [], [], []
             total_loss, count = 0.0, 0
 
+            # 仅初始化一次共享参数引用（每个 epoch 刷新一次以防模型结构变化）
             shared_params, _ = get_shared_params(model)
+            shared_params = [p for p in shared_params if p.requires_grad]
 
             # 创建进度条
-            if is_rank0():
-                pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=True, ncols=120)
-            else:
-                pbar = train_loader
-            
-            for step, (x, y1, y2) in enumerate(pbar):
-                x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=True, ncols=120) if is_rank0() else train_loader
 
-                # ======= CoGrad：前两个 backward 合并同步，最后一次再同步 =======
-                # 1) 任务1梯度
+            for step, (x, y1, y2) in enumerate(pbar):
+                x = x.to(device, non_blocking=True)
+                y1 = y1.to(device, non_blocking=True)
+                y2 = y2.to(device, non_blocking=True)
+
+                # ======= CoGrad：单次 forward + 两次 backward（DDP下no_sync）=======
                 optimizer.zero_grad(set_to_none=True)
-                with model.no_sync() if is_dist() else contextlib.nullcontext():
+
+                with (model.no_sync() if is_dist() else contextlib.nullcontext()):
                     out = model(x)
+
+                    # --- 任务1 backward：保留图，缓存共享层梯度 g1 ---
                     loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
                     loss1.backward(retain_graph=True)
 
-                    task1_grads = {id(p): p.grad.detach().clone() for p in shared_params if p.grad is not None}
+                    task1_grads = {}
+                    for p in shared_params:
+                        if p.grad is not None:
+                            task1_grads[id(p)] = p.grad.detach().clone()
 
-                    # 2) 任务2梯度
-                    optimizer.zero_grad(set_to_none=True)
-                    out = model(x)
+                    # 清空“共享层”的梯度，仅为了拿到纯净的 g2（非共享层保持现状）
+                    for p in shared_params:
+                        p.grad = None
+
+                    # --- 任务2 backward：拿到共享层纯净梯度 g2 ---
                     loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
-                    loss2.backward(retain_graph=True)
-                    task2_grads = {id(p): p.grad.detach().clone() for p in shared_params if p.grad is not None}
+                    loss2.backward()  # 仍在 no_sync 内
 
-                # 3) CoGrad 调整共享层梯度
+                    task2_grads = {}
+                    for p in shared_params:
+                        if p.grad is not None:
+                            task2_grads[id(p)] = p.grad.detach().clone()
+
+                # --- CoGrad 投影：在共享层上重写 p.grad 为投影后的梯度 ---
                 cograd_step([task1_grads, task2_grads], shared_params, gammas=[args.gamma1, args.gamma2])
-                
-                # 4) 不要改 requires_grad！用 hook 把共享层梯度清零，避免更新
-                optimizer.zero_grad(set_to_none=True)
-                
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g) if g is not None else None)
-                         for p in shared_params]
-                
-                # 最后一遍 forward + backward（这次触发同步）
-                out = model(x)
-                loss_final = loss_fn(out[0], y1.unsqueeze(1).float()) + \
-                             loss_fn(out[1], y2.unsqueeze(1).float())
-                loss_final.backward()
-                
-                # 去掉 hook
-                for h in hooks:
-                    h.remove()
-                
+
+                # DDP：对共享层梯度做平均（一次 all_reduce）
+                if is_dist():
+                    for p in shared_params:
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+                # 更新参数（注意：非共享层此时保留的是“第二次 backward”的梯度，这与原先快版本一致）
                 optimizer.step()
 
-                # ======= CoGrad 结束 =======
+                # ======= 记录训练指标（不在 step 内算 AUC）=======
+                with torch.no_grad():
+                    y1_true.extend(y1.squeeze().detach().cpu().numpy().tolist())
+                    y2_true.extend(y2.squeeze().detach().cpu().numpy().tolist())
+                    y1_pred.extend(out[0].squeeze().detach().cpu().numpy().tolist())
+                    y2_pred.extend(out[1].squeeze().detach().cpu().numpy().tolist())
 
-                y1_true += list(y1.squeeze().cpu().numpy())
-                y2_true += list(y2.squeeze().cpu().numpy())
-                y1_pred += list(out[0].squeeze().detach().cpu().numpy())
-                y2_pred += list(out[1].squeeze().detach().cpu().numpy())
+                    batch_loss = float((loss1 + loss2).item())
+                    total_loss += batch_loss
+                    count += 1
 
-                total_loss += float(loss_final.item())
-                count += 1
-                if is_rank0():
-                    pbar.set_postfix({'loss': f'{float(loss_final.item()):.4f}', 'avg_loss': f'{total_loss/count:.4f}'})
+                    if is_rank0():
+                        pbar.set_postfix({'loss': f'{batch_loss:.4f}', 'avg_loss': f'{total_loss/max(count,1):.4f}'})
 
-            # ------- 训练日志（只 rank0 打印） -------
             if is_rank0():
-                click_auc = roc_auc_score(y1_true, y1_pred) if len(set(y1_true)) > 1 else 0.5
-                like_auc  = roc_auc_score(y2_true, y2_pred) if len(set(y2_true)) > 1 else 0.5
+                try:
+                    click_auc = roc_auc_score(y1_true, y1_pred) if len(set(y1_true)) > 1 else 0.5
+                    like_auc  = roc_auc_score(y2_true, y2_pred) if len(set(y2_true)) > 1 else 0.5
+                except Exception:
+                    click_auc, like_auc = 0.5, 0.5
                 print(f"Epoch {epoch+1} train loss {total_loss / max(count,1):.4f}, "
                       f"click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
 
@@ -140,21 +150,25 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
                 vy1_true, vy2_true, vy1_pred, vy2_pred = [], [], [], []
 
-                for x, y1, y2 in val_loader:
-                    x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
+                # rank0 才开进度条（可选）
+                val_iter = tqdm(val_loader, desc='Validation', leave=False, ncols=100) if is_rank0() else val_loader
+
+                for x, y1, y2 in val_iter:
+                    x = x.to(device, non_blocking=True)
+                    y1 = y1.to(device, non_blocking=True)
+                    y2 = y2.to(device, non_blocking=True)
+
                     out = model(x)
                     loss = loss_fn(out[0], y1.unsqueeze(1).float()) + \
                            loss_fn(out[1], y2.unsqueeze(1).float())
                     local_loss_sum += loss.detach()
                     local_cnt      += 1
 
-                    # 收集本 rank 的 AUC 数据（稍后只在 rank0 聚合）
-                    vy1_true += list(y1.squeeze().cpu().numpy())
-                    vy2_true += list(y2.squeeze().cpu().numpy())
-                    vy1_pred += list(out[0].squeeze().cpu().numpy())
-                    vy2_pred += list(out[1].squeeze().cpu().numpy())
+                    vy1_true.extend(y1.squeeze().detach().cpu().numpy().tolist())
+                    vy2_true.extend(y2.squeeze().detach().cpu().numpy().tolist())
+                    vy1_pred.extend(out[0].squeeze().detach().cpu().numpy().tolist())
+                    vy2_pred.extend(out[1].squeeze().detach().cpu().numpy().tolist())
 
-                # 所有 rank 聚合 val loss（防止步数不同）
                 if is_dist():
                     dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM)
                     dist.all_reduce(local_cnt,      op=dist.ReduceOp.SUM)
@@ -163,8 +177,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
                 if is_dist():
                     gathered = [None for _ in range(dist.get_world_size())]
-                    dist.gather_object((vy1_true, vy1_pred, vy2_true, vy2_pred), 
-                                      gathered if is_rank0() else None, dst=0)
+                    dist.gather_object((vy1_true, vy1_pred, vy2_true, vy2_pred),
+                                       gathered if is_rank0() else None, dst=0)
 
                     if is_rank0():
                         all_y1_true, all_y1_pred, all_y2_true, all_y2_pred = [], [], [], []
@@ -193,7 +207,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             model.train()
 
         # ================= 测试（所有 rank 都跑，rank0 汇总打印） =================
-        state = torch.load(save_path, map_location=device, weights_only=False)
+        state = torch.load(save_path, map_location=device)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
 
@@ -202,18 +216,23 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             local_loss_sum = torch.tensor([0.0], device=device)
             local_cnt      = torch.tensor([0], device=device)
 
-            for x, y1, y2 in test_loader:
-                x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
+            test_iter = tqdm(test_loader, desc='Testing', ncols=100) if is_rank0() else test_loader
+
+            for x, y1, y2 in test_iter:
+                x = x.to(device, non_blocking=True)
+                y1 = y1.to(device, non_blocking=True)
+                y2 = y2.to(device, non_blocking=True)
+
                 out = model(x)
                 loss = loss_fn(out[0], y1.unsqueeze(1).float()) + \
                        loss_fn(out[1], y2.unsqueeze(1).float())
                 local_loss_sum += loss.detach()
                 local_cnt      += 1
 
-                ty1_true += list(y1.squeeze().cpu().numpy())
-                ty2_true += list(y2.squeeze().cpu().numpy())
-                ty1_pred += list(out[0].squeeze().cpu().numpy())
-                ty2_pred += list(out[1].squeeze().cpu().numpy())
+                ty1_true.extend(y1.squeeze().detach().cpu().numpy().tolist())
+                ty2_true.extend(y2.squeeze().detach().cpu().numpy().tolist())
+                ty1_pred.extend(out[0].squeeze().detach().cpu().numpy().tolist())
+                ty2_pred.extend(out[1].squeeze().detach().cpu().numpy().tolist())
 
             if is_dist():
                 dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM)
@@ -223,8 +242,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
             if is_dist():
                 gathered = [None for _ in range(dist.get_world_size())]
-                dist.gather_object((ty1_true, ty1_pred, ty2_true, ty2_pred), 
-                                  gathered if is_rank0() else None, dst=0)
+                dist.gather_object((ty1_true, ty1_pred, ty2_true, ty2_pred),
+                                   gathered if is_rank0() else None, dst=0)
                 if is_rank0():
                     a1t, a1p, a2t, a2p = [], [], [], []
                     for pack in gathered:
@@ -234,16 +253,12 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     click_auc = roc_auc_score(a1t, a1p) if len(set(a1t)) > 1 else 0.5
                     like_auc  = roc_auc_score(a2t, a2p) if len(set(a2t)) > 1 else 0.5
                     print(f"Test loss {mean_test_loss:.4f}, click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
-                    
-                    # 记录结果到CSV（多任务）
                     if logger is not None:
                         logger.log_result(args, best_eval_loss, click_auc, like_auc)
             else:
                 click_auc = roc_auc_score(ty1_true, ty1_pred) if len(set(ty1_true)) > 1 else 0.5
                 like_auc  = roc_auc_score(ty2_true, ty2_pred) if len(set(ty2_true)) > 1 else 0.5
                 print(f"Test loss {mean_test_loss:.4f}, click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
-                
-                # 记录结果到CSV（多任务）
                 if logger is not None:
                     logger.log_result(args, best_eval_loss, click_auc, like_auc)
 
@@ -257,71 +272,68 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     train_loader.sampler.set_epoch(i)
                 if is_dist() and hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
                     val_loader.sampler.set_epoch(i)
-        
+
                 # ====== 训练 ======
                 y_train_true, y_train_pred = [], []
                 total_loss, count = 0.0, 0
-        
-                # 创建进度条
-                if is_rank0():
-                    pbar = tqdm(train_loader, desc=f'Epoch {i+1}/{epochs}', leave=True, ncols=120)
-                else:
-                    pbar = train_loader
-                
+
+                pbar = tqdm(train_loader, desc=f'Epoch {i+1}/{epochs}', leave=True, ncols=120) if is_rank0() else train_loader
+
                 for x, y in pbar:
-                    x, y = x.to(device), y.to(device)
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
                     pred = model(x)
                     logits = pred[0] if isinstance(pred, (list, tuple)) else pred
-        
-                    y_train_true += list(y.detach().cpu().numpy())
-                    y_train_pred += list(logits.detach().cpu().numpy().squeeze())
-        
+
+                    y_train_true.extend(y.detach().cpu().numpy().tolist())
+                    y_train_pred.extend(logits.detach().cpu().numpy().squeeze().tolist() if hasattr(logits.detach().cpu().numpy(), 'tolist') else logits.detach().cpu().numpy().tolist())
+
                     loss = loss_fn(logits, y.unsqueeze(1).float())
-        
+
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     optimizer.step()
-        
+
                     total_loss += float(loss.item())
                     count += 1
-                    # 更新进度条
                     if is_rank0():
-                        pbar.set_postfix({'loss': f'{float(loss.item()):.3f}', 'avg_loss': f'{total_loss/count:.3f}'})
-        
+                        pbar.set_postfix({'loss': f'{float(loss.item()):.3f}', 'avg_loss': f'{total_loss/max(count,1):.3f}'})
+
                 if is_rank0():
                     auc = roc_auc_score(y_train_true, y_train_pred) if len(set(y_train_true)) > 1 else 0.5
                     print(f"Epoch {i+1} train loss {total_loss / max(count,1):.3f}, AUC {auc:.3f}")
-        
+
                 # ====== 验证（所有 rank 都跑，rank0 聚合打印/保存）======
                 model.eval()
                 with torch.no_grad():
                     local_loss_sum = torch.tensor([0.0], device=device)
                     local_cnt      = torch.tensor([0],   device=device)
-        
+
                     y_val_true, y_val_pred = [], []
-        
+
                     for x, y in val_loader:
-                        x, y = x.to(device), y.to(device)
+                        x = x.to(device, non_blocking=True)
+                        y = y.to(device, non_blocking=True)
                         pred = model(x)
                         logits = pred[0] if isinstance(pred, (list, tuple)) else pred
-        
-                        y_val_true += list(y.detach().cpu().numpy())
-                        y_val_pred += list(logits.detach().cpu().numpy().squeeze())
-        
+
+                        y_val_true.extend(y.detach().cpu().numpy().tolist())
+                        y_val_pred.extend(logits.detach().cpu().numpy().squeeze().tolist() if hasattr(logits.detach().cpu().numpy(), 'tolist') else logits.detach().cpu().numpy().tolist())
+
                         vloss = loss_fn(logits, y.unsqueeze(1).float())
                         local_loss_sum += vloss
                         local_cnt += 1
-        
+
                     if is_dist():
                         dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM)
                         dist.all_reduce(local_cnt,      op=dist.ReduceOp.SUM)
-        
+
                     mean_val_loss = (local_loss_sum / torch.clamp(local_cnt, min=1)).item()
-        
+
                     if is_dist():
                         gathered = [None for _ in range(dist.get_world_size())]
                         dist.gather_object((y_val_true, y_val_pred), gathered if is_rank0() else None, dst=0)
-        
+
                         if is_rank0():
                             all_t, all_p = [], []
                             for pack in gathered:
@@ -329,8 +341,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                                 all_t += t; all_p += p
                             auc = roc_auc_score(all_t, all_p) if len(set(all_t)) > 1 else 0.5
                             print(f"Epoch {i+1} val loss {mean_val_loss:.3f}, AUC {auc:.3f}")
-        
-                            # 保存 best
+
                             if mean_val_loss < best_eval_loss:
                                 best_eval_loss = mean_val_loss
                                 torch.save(get_state_dict(model), save_path)
@@ -342,15 +353,21 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                             best_eval_loss = mean_val_loss
                             torch.save(get_state_dict(model), save_path)
                             print(f"[rank0] saved best to: {save_path}")
-        
+
                 if is_dist():
                     dist.barrier()
                 model.train()
-        
+
         # ====== 测试（所有 rank 都跑，rank0 聚合打印）======
-        state = torch.load(save_path, map_location=device, weights_only=False)
+        state = torch.load(save_path, map_location=device)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
+
+    # DDP 结束清理
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
         
         with torch.no_grad():
             local_loss_sum = torch.tensor([0.0], device=device)
