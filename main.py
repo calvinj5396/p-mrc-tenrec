@@ -494,6 +494,14 @@ if __name__ == "__main__":
     parser.add_argument('--l2_emb', default=0.0, type=float)
     #mtl
     parser.add_argument('--mtl_task_num', type=int, default=1, help='0:like, 1:click, 2:two tasks')
+    # 在 #mtl 注释下面添加这几行
+    parser.add_argument('--mtl_task_num', type=int, default=1, help='0:like, 1:click, 2:two tasks')
+    
+    # 添加 PFE 相关参数
+    parser.add_argument('--pfe_use', type=bool, default=True, help='Whether to use PFE')
+    parser.add_argument('--pfe_proto_num', type=int, default=4, help='Number of prototype centers')
+    parser.add_argument('--pfe_temp', type=float, default=0.3, help='Temperature for PFE routing')
+    parser.add_argument('--n_expert', type=int, default=2, help='Number of shared experts')
 
     #CF
     parser.add_argument('--test_method', default='ufo', type=str)
@@ -645,14 +653,17 @@ if __name__ == "__main__":
         if args.model_name == 'esmm':
             model = ESMM(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, num_task=num_task)
         else:
-            model = MMOE(
-                user_feature_dict, item_feature_dict,
-                emb_dim=args.embedding_size,
-                num_task=num_task,
-                use_pfe=True, pfe_proto_num=8, pfe_temp=1.0,
-                use_resflow=True,
-                gate_tau=1.0,
-            )
+             model = MMOE(
+            user_feature_dict, item_feature_dict,
+            emb_dim=args.embedding_size,
+            num_task=num_task,
+            n_expert=args.n_expert,              # 从 args 读取
+            use_pfe=args.pfe_use,                # 从 args 读取
+            pfe_proto_num=args.pfe_proto_num,    # 从 args 读取
+            pfe_temp=args.pfe_temp,              # 从 args 读取
+            use_resflow=True,
+            gate_tau=1.0,
+        )
 
     
         # 3) 包装：优先 DDP，其次 DP，最后单卡（不要再次 init）
@@ -748,6 +759,10 @@ if __name__ == "__main__":
                     print("\n✓ 可视化完成，图片已保存到:", args.save_path)
                 else:
                     print("❌ 未收集到PFE数据，请检查模型配置")
+            
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
 
     elif args.task_name == 'transfer_learning':
         print('=============transfer_learning=============')

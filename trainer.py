@@ -420,9 +420,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 auc = roc_auc_score(y_test_true, y_test_pred) if len(set(y_test_true)) > 1 else 0.5
                 print(f"Test loss {mean_test_loss:.3f}, AUC {auc:.3f}")
 
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+
 
 def Infacc_Trainer(epoch, b_model, p_model, dataloader, b_optimizer, p_optimizer, writer, args):
     print("+" * 20, "Train Epoch {}".format(epoch + 1), "+" * 20)
