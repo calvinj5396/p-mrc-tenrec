@@ -19,7 +19,7 @@ import torch.distributed as dist
 from torch.nn import functional as F
 import torch
 
-
+from tqdm import tqdm
 
 
 def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
@@ -49,7 +49,6 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
     # 初始化logger（只在rank0）
     logger = None
     if is_rank0():
-        from utils.result_logger import ResultLogger
         logger = ResultLogger(args.save_path, args.seed)
 
     # ================= 多任务 =================
@@ -67,7 +66,13 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
             shared_params, _ = get_shared_params(model)
 
-            for step, (x, y1, y2) in enumerate(train_loader):
+            # 创建进度条
+            if is_rank0():
+                pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=True, ncols=120)
+            else:
+                pbar = train_loader
+            
+            for step, (x, y1, y2) in enumerate(pbar):
                 x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
 
                 # ======= CoGrad：前两个 backward 合并同步，最后一次再同步 =======
@@ -117,6 +122,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
                 total_loss += float(loss_final.item())
                 count += 1
+                if is_rank0():
+                    pbar.set_postfix({'loss': f'{float(loss_final.item()):.4f}', 'avg_loss': f'{total_loss/count:.4f}'})
 
             # ------- 训练日志（只 rank0 打印） -------
             if is_rank0():
@@ -255,7 +262,13 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 y_train_true, y_train_pred = [], []
                 total_loss, count = 0.0, 0
         
-                for x, y in train_loader:
+                # 创建进度条
+                if is_rank0():
+                    pbar = tqdm(train_loader, desc=f'Epoch {i+1}/{epochs}', leave=True, ncols=120)
+                else:
+                    pbar = train_loader
+                
+                for x, y in pbar:
                     x, y = x.to(device), y.to(device)
                     pred = model(x)
                     logits = pred[0] if isinstance(pred, (list, tuple)) else pred
@@ -271,6 +284,9 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
         
                     total_loss += float(loss.item())
                     count += 1
+                    # 更新进度条
+                    if is_rank0():
+                        pbar.set_postfix({'loss': f'{float(loss.item()):.3f}', 'avg_loss': f'{total_loss/count:.3f}'})
         
                 if is_rank0():
                     auc = roc_auc_score(y_train_true, y_train_pred) if len(set(y_train_true)) > 1 else 0.5
