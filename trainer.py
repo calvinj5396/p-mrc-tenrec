@@ -10,7 +10,7 @@ import torch.distributed as dist
 from metrics import *
 from cograd_utils import get_shared_params, cograd_step   # <<< 新增
 import contextlib
-
+from utils import ResultLogger
 import torch.distributed as dist
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
@@ -45,6 +45,12 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # 初始化logger（只在rank0）
+    logger = None
+    if is_rank0():
+        from utils.result_logger import ResultLogger
+        logger = ResultLogger(args.save_path, args.seed)
 
     # ================= 多任务 =================
     if args.mtl_task_num == 2 and train:
@@ -54,7 +60,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             if is_dist() and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
             if is_dist() and hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
-                val_loader.sampler.set_epoch(epoch)  # 可选，确定性
+                val_loader.sampler.set_epoch(epoch)
 
             y1_true, y2_true, y1_pred, y2_pred = [], [], [], []
             total_loss, count = 0.0, 0
@@ -82,7 +88,6 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     task2_grads = {id(p): p.grad.detach().clone() for p in shared_params if p.grad is not None}
 
                 # 3) CoGrad 调整共享层梯度
-
                 cograd_step([task1_grads, task2_grads], shared_params, gammas=[args.gamma1, args.gamma2])
                 
                 # 4) 不要改 requires_grad！用 hook 把共享层梯度清零，避免更新
@@ -126,8 +131,6 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 local_loss_sum = torch.tensor([0.0], device=device)
                 local_cnt      = torch.tensor([0], device=device)
 
-                # 如果你要在分布式下做全量 AUC，需要做变长 all_gather。
-                # 为了简化，这里先只做 loss 作为 early-stop/保存依据；AUC 只 rank0 用全局 gather 计算（见下）。
                 vy1_true, vy2_true, vy1_pred, vy2_pred = [], [], [], []
 
                 for x, y1, y2 in val_loader:
@@ -151,12 +154,10 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
                 mean_val_loss = (local_loss_sum / torch.clamp(local_cnt, min=1)).item()
 
-                # AUC：把每个 rank 的数组长度先 gather，再 padding all_gather（简单起见：只在 rank0 用 CPU concat 来算）
-                # 小规模数据可以用下面的“CPU 收集”法：每个 rank 把本地 AUC 发到 rank0（仅限单机）
                 if is_dist():
-                    # 简便起见，用 obj_gather（单机可用，跨机需 torch.distributed.gather_object 支持）
                     gathered = [None for _ in range(dist.get_world_size())]
-                    dist.gather_object((vy1_true, vy1_pred, vy2_true, vy2_pred), gathered if is_rank0() else None, dst=0)
+                    dist.gather_object((vy1_true, vy1_pred, vy2_true, vy2_pred), 
+                                      gathered if is_rank0() else None, dst=0)
 
                     if is_rank0():
                         all_y1_true, all_y1_pred, all_y2_true, all_y2_pred = [], [], [], []
@@ -185,8 +186,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             model.train()
 
         # ================= 测试（所有 rank 都跑，rank0 汇总打印） =================
-        # 先让每个 rank 都 load 同一份权重（rank0 广播 OK，也可以直接各自 load）
-        state = torch.load(save_path, map_location=device)
+        state = torch.load(save_path, map_location=device, weights_only=False)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
 
@@ -216,7 +216,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
 
             if is_dist():
                 gathered = [None for _ in range(dist.get_world_size())]
-                dist.gather_object((ty1_true, ty1_pred, ty2_true, ty2_pred), gathered if is_rank0() else None, dst=0)
+                dist.gather_object((ty1_true, ty1_pred, ty2_true, ty2_pred), 
+                                  gathered if is_rank0() else None, dst=0)
                 if is_rank0():
                     a1t, a1p, a2t, a2p = [], [], [], []
                     for pack in gathered:
@@ -226,16 +227,24 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     click_auc = roc_auc_score(a1t, a1p) if len(set(a1t)) > 1 else 0.5
                     like_auc  = roc_auc_score(a2t, a2p) if len(set(a2t)) > 1 else 0.5
                     print(f"Test loss {mean_test_loss:.4f}, click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
+                    
+                    # 记录结果到CSV（多任务）
+                    if logger is not None:
+                        logger.log_result(args, best_eval_loss, click_auc, like_auc)
             else:
                 click_auc = roc_auc_score(ty1_true, ty1_pred) if len(set(ty1_true)) > 1 else 0.5
                 like_auc  = roc_auc_score(ty2_true, ty2_pred) if len(set(ty2_true)) > 1 else 0.5
                 print(f"Test loss {mean_test_loss:.4f}, click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
-    # ====================== 单任务 ======================
+                
+                # 记录结果到CSV（多任务）
+                if logger is not None:
+                    logger.log_result(args, best_eval_loss, click_auc, like_auc)
+
     # ====================== 单任务 ======================
     else:
         if train:
             model.train()
-            for i in range(epochs):  # <- 修复: epochs
+            for i in range(epochs):
                 # DDP 下保证 shuffle/确定性
                 if is_dist() and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                     train_loader.sampler.set_epoch(i)
@@ -249,13 +258,12 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 for x, y in train_loader:
                     x, y = x.to(device), y.to(device)
                     pred = model(x)
-                    # 如果 pred 已经是 shape [B,1]，就用 pred.squeeze(1)
                     logits = pred[0] if isinstance(pred, (list, tuple)) else pred
         
                     y_train_true += list(y.detach().cpu().numpy())
                     y_train_pred += list(logits.detach().cpu().numpy().squeeze())
         
-                    loss = loss_fn(logits, y.unsqueeze(1).float())   # <- 修复: loss_fn
+                    loss = loss_fn(logits, y.unsqueeze(1).float())
         
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -295,7 +303,6 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     mean_val_loss = (local_loss_sum / torch.clamp(local_cnt, min=1)).item()
         
                     if is_dist():
-                        # 简便：各 rank 把本地的 AUC 数据发到 rank0
                         gathered = [None for _ in range(dist.get_world_size())]
                         dist.gather_object((y_val_true, y_val_pred), gathered if is_rank0() else None, dst=0)
         
@@ -310,22 +317,22 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                             # 保存 best
                             if mean_val_loss < best_eval_loss:
                                 best_eval_loss = mean_val_loss
-                                torch.save(get_state_dict(model), save_path)   # <- 修复: save_path
+                                torch.save(get_state_dict(model), save_path)
                                 print(f"[rank0] saved best to: {save_path}")
                     else:
                         auc = roc_auc_score(y_val_true, y_val_pred) if len(set(y_val_true)) > 1 else 0.5
                         print(f"Epoch {i+1} val loss {mean_val_loss:.3f}, AUC {auc:.3f}")
-                        if i == 0 or mean_val_loss < best_eval_loss:
+                        if mean_val_loss < best_eval_loss:
                             best_eval_loss = mean_val_loss
                             torch.save(get_state_dict(model), save_path)
                             print(f"[rank0] saved best to: {save_path}")
         
                 if is_dist():
-                    dist.barrier()  # 保存前后都 barrier，避免错位
+                    dist.barrier()
                 model.train()
         
         # ====== 测试（所有 rank 都跑，rank0 聚合打印）======
-        state = torch.load(save_path, map_location=device)
+        state = torch.load(save_path, map_location=device, weights_only=False)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
         
@@ -362,12 +369,20 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                         all_t += t; all_p += p
                     auc = roc_auc_score(all_t, all_p) if len(set(all_t)) > 1 else 0.5
                     print(f"Test loss {mean_test_loss:.3f}, AUC {auc:.3f}")
+                    
+                    # 单任务记录（like_auc设为0）
+                    if logger is not None:
+                        logger.log_result(args, best_eval_loss, auc, 0.0)
             else:
                 auc = roc_auc_score(y_test_true, y_test_pred) if len(set(y_test_true)) > 1 else 0.5
                 print(f"Test loss {mean_test_loss:.3f}, AUC {auc:.3f}")
+                
+                # 单任务记录（like_auc设为0）
+                if logger is not None:
+                    logger.log_result(args, best_eval_loss, auc, 0.0)
 
-# ====================== 单任务 ======================
-    if dist.is_available() and dist.is_initialized():
+    # ====================== 清理分布式环境 ======================
+    if is_dist():
         dist.barrier()
         dist.destroy_process_group()
 

@@ -51,6 +51,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import torch.nn.functional as F
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed")
 
 def visualize_routing_patterns(routing_weights, ctr_labels, like_labels, args):
     """分析不同任务的routing pattern差异"""
@@ -496,6 +498,21 @@ if __name__ == "__main__":
     parser.add_argument('--mtl_task_num', type=int, default=1, help='0:like, 1:click, 2:two tasks')
     
     # 添加 PFE 相关参数
+    parser.add_argument('--n_expert_per_task', type=int, default=2, 
+                        help='Number of experts per task')
+    parser.add_argument('--n_shared_expert', type=int, default=0, 
+                        help='Number of shared experts (0 for AdaTT-sp)')
+    parser.add_argument('--gate_type', type=str, default='softmax', 
+                        choices=['softmax', 'sigmoid'],
+                        help='Gate activation type')
+    parser.add_argument('--gate_tau', type=float, default=1.0, 
+                        help='Temperature for gate')
+    parser.add_argument('--use_resflow', type=lambda x: x.lower() == 'true', default=True,
+                        help='Enable ResFlow (our innovation)')
+    parser.add_argument('--ablation_no_native', type=lambda x: x.lower() == 'true', default=False,
+                        help='Ablation: disable NativeExpertLF')
+    parser.add_argument('--ablation_no_allexpert', type=lambda x: x.lower() == 'true', default=False,
+                        help='Ablation: disable AllExpertGF')
     parser.add_argument('--pfe_use', type=bool, default=True, help='Whether to use PFE')
     parser.add_argument('--pfe_proto_num', type=int, default=4, help='Number of prototype centers')
     parser.add_argument('--pfe_temp', type=float, default=0.3, help='Temperature for PFE routing')
@@ -650,6 +667,22 @@ if __name__ == "__main__":
         # 2) 先在 CPU 构建模型
         if args.model_name == 'esmm':
             model = ESMM(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, num_task=num_task)
+        elif args.model_name == 'adatt':
+            model = AdaTT(
+                user_feature_dict, item_feature_dict,
+                emb_dim=args.embedding_size,
+                num_task=num_task,
+                n_expert_per_task=args.n_expert_per_task,
+                n_shared_expert=args.n_shared_expert,
+                use_pfe=args.pfe_use,
+                pfe_proto_num=args.pfe_proto_num,
+                pfe_temp=args.pfe_temp,
+                gate_type=args.gate_type,
+                gate_tau=args.gate_tau,
+                use_resflow=args.use_resflow,
+                ablation_no_native=args.ablation_no_native,
+                ablation_no_allexpert=args.ablation_no_allexpert,
+            )
         else:
              model = MMOE(
             user_feature_dict, item_feature_dict,
@@ -670,7 +703,7 @@ if __name__ == "__main__":
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[args.device.index],
-                find_unused_parameters=True,      # 关键：允许本轮存在未参与 loss 的参数
+                find_unused_parameters=False,      # 关键：允许本轮存在未参与 loss 的参数
                 gradient_as_bucket_view=True      # 小优化：减少内存、加速 bucket 视图
             )
             print(f"[DDP] 已启用, local_rank={args.device.index}")

@@ -18,6 +18,99 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 
+import os
+import csv
+import datetime
+from typing import Dict, Any
+
+class ResultLogger:
+    def __init__(self, save_dir: str, seed: int):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.csv_file = os.path.join(save_dir, f"ablation_results_seed{seed}.csv")
+        self.init_csv()
+    
+    def init_csv(self):
+        """初始化CSV文件"""
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'exp_name', 'model_name', 'use_pfe', 'use_resflow', 
+                    'gamma1', 'gamma2', 'gate_type', 'gate_tau', 
+                    'n_expert_per_task', 'n_shared_expert',
+                    'best_val_loss', 'test_click_auc', 'test_like_auc',
+                    'ablation_no_native', 'ablation_no_allexpert',
+                    'timestamp'
+                ])
+    
+    def log_result(self, args, best_val_loss: float, 
+                   test_click_auc: float, test_like_auc: float):
+        """记录一次实验结果"""
+        # 构建实验名称
+        exp_name = self._build_exp_name(args)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 写入CSV
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                exp_name,
+                args.model_name,
+                getattr(args, 'pfe_use', False),
+                getattr(args, 'use_resflow', False),
+                getattr(args, 'gamma1', 0.0),
+                getattr(args, 'gamma2', 0.0),
+                getattr(args, 'gate_type', 'softmax'),
+                getattr(args, 'gate_tau', 1.0),
+                getattr(args, 'n_expert_per_task', 2),
+                getattr(args, 'n_shared_expert', 0),
+                f"{best_val_loss:.6f}",
+                f"{test_click_auc:.6f}",
+                f"{test_like_auc:.6f}",
+                getattr(args, 'ablation_no_native', False),
+                getattr(args, 'ablation_no_allexpert', False),
+                timestamp
+            ])
+        
+        # 打印结果
+        self._print_result(exp_name, best_val_loss, test_click_auc, test_like_auc)
+    
+    def _build_exp_name(self, args) -> str:
+        """根据配置构建实验名称"""
+        parts = [args.model_name.upper()]
+        
+        if hasattr(args, 'use_resflow') and args.use_resflow:
+            parts.append("ResFlow")
+        
+        if args.gamma1 > 0 or args.gamma2 > 0:
+            parts.append(f"CoGrad(γ1={args.gamma1},γ2={args.gamma2})")
+        
+        if hasattr(args, 'pfe_use') and args.pfe_use:
+            parts.append(f"PFE(K={getattr(args, 'pfe_proto_num', 4)})")
+        
+        if getattr(args, 'ablation_no_native', False):
+            parts.append("NoNative")
+        
+        if getattr(args, 'ablation_no_allexpert', False):
+            parts.append("NoAllExpert")
+        
+        if hasattr(args, 'gate_type') and args.gate_type == 'sigmoid':
+            parts.append(f"Sigmoid(τ={args.gate_tau})")
+        
+        return "+".join(parts)
+    
+    def _print_result(self, exp_name: str, val_loss: float, 
+                     click_auc: float, like_auc: float):
+        """打印结果摘要"""
+        print(f"\n{'='*70}")
+        print(f"  EXPERIMENT COMPLETED: {exp_name}")
+        print(f"{'='*70}")
+        print(f"  Best Val Loss:   {val_loss:.6f}")
+        print(f"  Test Click AUC:  {click_auc:.6f}")
+        print(f"  Test Like AUC:   {like_auc:.6f}")
+        print(f"  Results saved to: {self.csv_file}")
+        print(f"{'='*70}\n")
 tqdm.pandas()
 
 def select_sampler(train_data, val_data, test_data, user_count, item_count, args):
