@@ -46,7 +46,91 @@ from model.cf.lightgcn import LightGCN
 from model.cf.ngcf import NGCF
 # from model.cf.vae import VAECF
 # from model.cf.item2vec import Item2Vec
+# ========== PFE 可视化函数 ==========
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import torch.nn.functional as F
 
+def visualize_routing_patterns(routing_weights, ctr_labels, like_labels, args):
+    """分析不同任务的routing pattern差异"""
+    
+    high_ctr = routing_weights[ctr_labels > 0.5].mean(0)
+    low_ctr = routing_weights[ctr_labels <= 0.5].mean(0)
+    high_like = routing_weights[like_labels > 0.5].mean(0)
+    low_like = routing_weights[like_labels <= 0.5].mean(0)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    x = np.arange(routing_weights.size(1))
+    width = 0.35
+    
+    # CTR对比
+    axes[0].bar(x - width/2, high_ctr.numpy(), width, label='High CTR', alpha=0.8, color='#2ecc71')
+    axes[0].bar(x + width/2, low_ctr.numpy(), width, label='Low CTR', alpha=0.8, color='#e74c3c')
+    axes[0].set_xlabel('Prototype Center ID', fontsize=12)
+    axes[0].set_ylabel('Avg Routing Weight', fontsize=12)
+    axes[0].set_title('Routing Pattern: CTR Task', fontsize=14, fontweight='bold')
+    axes[0].legend(fontsize=11)
+    axes[0].set_xticks(x)
+    axes[0].grid(axis='y', alpha=0.3)
+    
+    # Like对比
+    axes[1].bar(x - width/2, high_like.numpy(), width, label='High Like', alpha=0.8, color='#3498db')
+    axes[1].bar(x + width/2, low_like.numpy(), width, label='Low Like', alpha=0.8, color='#9b59b6')
+    axes[1].set_xlabel('Prototype Center ID', fontsize=12)
+    axes[1].set_ylabel('Avg Routing Weight', fontsize=12)
+    axes[1].set_title('Routing Pattern: Like Task', fontsize=14, fontweight='bold')
+    axes[1].legend(fontsize=11)
+    axes[1].set_xticks(x)
+    axes[1].grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    save_path = os.path.join(args.save_path, f'pfe_routing_patterns_seed{args.seed}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Saved: {save_path}")
+    
+    # 打印数值差异
+    print("\n--- Routing Differences Analysis ---")
+    for i in range(len(high_ctr)):
+        ctr_diff = (high_ctr[i] - low_ctr[i]).item()
+        like_diff = (high_like[i] - low_like[i]).item()
+        print(f"Center {i}: CTR_diff={ctr_diff:+.4f}, Like_diff={like_diff:+.4f}")
+
+
+def compare_feature_spaces_tsne(before, after, labels, args):
+    """t-SNE可视化PFE前后的特征空间"""
+    from sklearn.manifold import TSNE
+    
+    # 降维
+    tsne = TSNE(n_components=2, random_state=args.seed, perplexity=30)
+    before_2d = tsne.fit_transform(before.numpy())
+    after_2d = tsne.fit_transform(after.numpy())
+    
+    # 绘图
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    scatter1 = ax1.scatter(before_2d[:, 0], before_2d[:, 1], 
+                          c=labels.numpy(), cmap='RdYlGn', alpha=0.6, s=20, edgecolors='k', linewidth=0.3)
+    ax1.set_title('Feature Space BEFORE PFE', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('t-SNE Dimension 1', fontsize=12)
+    ax1.set_ylabel('t-SNE Dimension 2', fontsize=12)
+    cbar1 = plt.colorbar(scatter1, ax=ax1)
+    cbar1.set_label('CTR Label', fontsize=11)
+    
+    scatter2 = ax2.scatter(after_2d[:, 0], after_2d[:, 1], 
+                          c=labels.numpy(), cmap='RdYlGn', alpha=0.6, s=20, edgecolors='k', linewidth=0.3)
+    ax2.set_title('Feature Space AFTER PFE', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('t-SNE Dimension 1', fontsize=12)
+    ax2.set_ylabel('t-SNE Dimension 2', fontsize=12)
+    cbar2 = plt.colorbar(scatter2, ax=ax2)
+    cbar2.set_label('CTR Label', fontsize=11)
+    
+    plt.tight_layout()
+    save_path = os.path.join(args.save_path, f'pfe_tsne_comparison_seed{args.seed}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Saved: {save_path}")
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
 def select_sampler(train_data, val_data, test_data, user_count, item_count, args):
@@ -410,6 +494,12 @@ if __name__ == "__main__":
     parser.add_argument('--l2_emb', default=0.0, type=float)
     #mtl
     parser.add_argument('--mtl_task_num', type=int, default=1, help='0:like, 1:click, 2:two tasks')
+    
+    # 添加 PFE 相关参数
+    parser.add_argument('--pfe_use', type=bool, default=True, help='Whether to use PFE')
+    parser.add_argument('--pfe_proto_num', type=int, default=4, help='Number of prototype centers')
+    parser.add_argument('--pfe_temp', type=float, default=0.3, help='Temperature for PFE routing')
+    parser.add_argument('--n_expert', type=int, default=2, help='Number of shared experts')
 
     #CF
     parser.add_argument('--test_method', default='ufo', type=str)
@@ -561,14 +651,17 @@ if __name__ == "__main__":
         if args.model_name == 'esmm':
             model = ESMM(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, num_task=num_task)
         else:
-            model = MMOE(
-                user_feature_dict, item_feature_dict,
-                emb_dim=args.embedding_size,
-                num_task=num_task,
-                use_pfe=True, pfe_proto_num=8, pfe_temp=1.0,
-                use_resflow=True,
-                gate_tau=1.0,
-            )
+             model = MMOE(
+            user_feature_dict, item_feature_dict,
+            emb_dim=args.embedding_size,
+            num_task=num_task,
+            n_expert=args.n_expert,              # 从 args 读取
+            use_pfe=args.pfe_use,                # 从 args 读取
+            pfe_proto_num=args.pfe_proto_num,    # 从 args 读取
+            pfe_temp=args.pfe_temp,              # 从 args 读取
+            use_resflow=True,
+            gate_tau=1.0,
+        )
 
     
         # 3) 包装：优先 DDP，其次 DP，最后单卡（不要再次 init）
@@ -587,11 +680,87 @@ if __name__ == "__main__":
             print(f"[DP] 已启用, 使用 {torch.cuda.device_count()} 张 GPU")
         else:
             model = model.to(args.device)
-    
-        # 4) 开训
+        ## 开训
         mtlTrain(model, train_dataloader, val_dataloader, test_dataloader, args, train=True)
-    
-
+        
+        # ========== PFE 可视化分析 ==========
+        # 修正1: 正确的分布式检查
+        is_rank0 = (not (dist.is_available() and dist.is_initialized())) or dist.get_rank() == 0
+        
+        if is_rank0:
+            print("\n" + "="*50)
+            print("  PFE Visualization Analysis")
+            print("="*50)
+            
+            # 加载最佳模型
+            save_path = os.path.join(
+                args.save_path,
+                f"{args.task_name}_{args.model_name}_seed{args.seed}_best_model_{args.mtl_task_num}.pth"
+            )
+            state = torch.load(save_path, map_location=args.device)
+            raw_model = model.module if hasattr(model, 'module') else model
+            raw_model.load_state_dict(state)
+            raw_model.eval()
+            
+            # 修正2: 检查模型是否支持可视化
+            if not hasattr(raw_model, '_build_hidden') or not hasattr(raw_model, 'pfe'):
+                print("⚠️  模型不支持PFE可视化（缺少 _build_hidden 或 pfe 属性）")
+            else:
+                # 收集PFE分析数据
+                # 收集PFE分析数据
+                pfe_data = {
+                    'routing_weights': [],
+                    'features_before': [],
+                    'features_after': [],
+                    'ctr_labels': [],
+                    'like_labels': []
+                }
+                
+                with torch.no_grad():
+                    for i, (x, y1, y2) in enumerate(test_dataloader):
+                        if i >= 50:  # 只取前50个batch
+                            break
+                            
+                        x = x.to(args.device)
+                        hidden = raw_model._build_hidden(x)
+                        
+                        # 计算routing weights
+                        dist_matrix = torch.cdist(hidden, raw_model.pfe.centers, p=2)
+                        weights = F.softmax(-dist_matrix / raw_model.pfe.temp, dim=1)
+                        
+                        # PFE后的特征
+                        enhanced = raw_model.pfe(hidden)
+                        
+                        # 动态确定batch大小（控制内存）
+                        batch_size = min(32, hidden.size(0))
+                        
+                        # 所有数据保持一致的维度
+                        pfe_data['routing_weights'].append(weights.cpu()[:batch_size])
+                        pfe_data['features_before'].append(hidden.cpu()[:batch_size])
+                        pfe_data['features_after'].append(enhanced.cpu()[:batch_size])
+                        pfe_data['ctr_labels'].append(y1.cpu()[:batch_size])
+                        pfe_data['like_labels'].append(y2.cpu()[:batch_size])
+                
+                # 修正4: 检查数据是否收集成功
+                if pfe_data['routing_weights']:
+                    all_routing = torch.cat(pfe_data['routing_weights'])
+                    all_ctr = torch.cat(pfe_data['ctr_labels'])
+                    all_like = torch.cat(pfe_data['like_labels'])
+                    
+                    visualize_routing_patterns(all_routing, all_ctr, all_like, args)
+                    
+                    all_before = torch.cat(pfe_data['features_before'])
+                    all_after = torch.cat(pfe_data['features_after'])
+                    
+                    compare_feature_spaces_tsne(all_before, all_after, all_ctr, args)
+                    
+                    print("\n✓ 可视化完成，图片已保存到:", args.save_path)
+                else:
+                    print("❌ 未收集到PFE数据，请检查模型配置")
+            
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
 
     elif args.task_name == 'transfer_learning':
         print('=============transfer_learning=============')
