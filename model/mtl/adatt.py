@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-AdaTT + ResFlow + CoGrad 完整实现
-
-架构说明：
-- AdaTT (KDD 2023): Task-to-Task Fusion基础架构
-- ResFlow: 我们的创新 - 跨任务残差信息流
-- CoGrad: 我们的创新 - 多任务梯度协同优化（在trainer中实现）
-- PFE: 可选的原型特征增强模块
-
-关键设计：
-1. 每个任务有自己的task-specific experts
-2. 每个任务的gate可以看到所有任务的experts（task-to-task fusion）
-3. NativeExpertLF + AllExpertGF残差连接
-4. 可选的ResFlow在任务间传递信息
+AdaTT 完整版：
+1. Expert为双层MLP
+2. Shared expert在多层间正确传递
+3. 最后一层shared unit只产出expert，不做融合
 """
 
 from typing import Dict, Tuple, List, Optional
@@ -22,7 +13,7 @@ import torch.nn.functional as F
 
 
 class PFELayer(nn.Module):
-    """Prototype Feature Enhancement (可选模块)"""
+    """Prototype Feature Enhancement"""
     def __init__(self, in_dim: int, num_proto: int = 4, temp: float = 1.0):
         super().__init__()
         self.in_dim = in_dim
@@ -38,14 +29,25 @@ class PFELayer(nn.Module):
         return z
 
 
+class ExpertNetwork(nn.Module):
+    """双层MLP Expert"""
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, activation=F.relu):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        self.activation = activation
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(x)
+        if self.activation is not None:
+            h = self.activation(h)
+        out = self.fc2(h)
+        return out
+
+
 class AdaTT(nn.Module):
     """
-    AdaTT: Adaptive Task-to-Task Fusion Network
-    
-    基于 KDD 2023 论文，集成我们的创新：
-    - ResFlow: 跨任务残差信息流
-    - CoGrad: 梯度协同优化（在trainer中）
-    - PFE: 原型特征增强
+    AdaTT: 双层Expert + 多层融合 + 正确的Shared Expert传递
     """
 
     def __init__(
@@ -53,9 +55,10 @@ class AdaTT(nn.Module):
         user_feature_dict: Dict[str, Tuple[int, int]],
         item_feature_dict: Dict[str, Tuple[int, int]],
         emb_dim: int = 128,
-        n_expert_per_task: int = 2,          # 每个任务的expert数量
-        n_shared_expert: int = 0,            # shared expert数量(默认0，使用AdaTT-sp)
-        mmoe_hidden_dim: int = 128,
+        n_expert_per_task: int = 2,
+        n_shared_expert: int = 0,
+        expert_dims: List[int] = [256, 128],  # Expert的[hidden, output]维度
+        num_fusion_levels: int = 2,           # 融合层数
         hidden_dim: List[int] = [128, 128],
         dropouts: List[float] = [0.5, 0.5],
         output_size: int = 1,
@@ -71,13 +74,13 @@ class AdaTT(nn.Module):
         gate_type: str = 'softmax',
         gate_tau: float = 1.0,
         
-        # ResFlow配置（我们的创新）
+        # ResFlow配置
         use_resflow: bool = False,
         res_dim: Optional[int] = None,
         res_use_norm: bool = False,
         res_detach: bool = True,
         
-        # 消融实验开关
+        # 消融开关
         ablation_no_native: bool = False,
         ablation_no_allexpert: bool = False,
     ):
@@ -91,7 +94,7 @@ class AdaTT(nn.Module):
         self.num_task = num_task
         self.n_expert_per_task = n_expert_per_task
         self.n_shared_expert = n_shared_expert
-        self.mmoe_hidden_dim = mmoe_hidden_dim
+        self.num_fusion_levels = num_fusion_levels
         self.expert_activation = expert_activation
         
         self.use_pfe = use_pfe
@@ -100,7 +103,6 @@ class AdaTT(nn.Module):
         self.gate_tau = gate_tau
         self.res_detach = res_detach
         
-        # 消融开关
         self.ablation_no_native = ablation_no_native
         self.ablation_no_allexpert = ablation_no_allexpert
         
@@ -116,74 +118,92 @@ class AdaTT(nn.Module):
         for name, (voc_size, _) in self.item_feature_dict.items():
             if voc_size > 1:
                 item_cate_cnt += 1
-                setattr(self, item_cate, nn.Embedding(voc_size, emb_dim))
+                setattr(self, name, nn.Embedding(voc_size, emb_dim))
 
         hidden_size = emb_dim * (user_cate_cnt + item_cate_cnt) \
                       + (len(self.user_feature_dict) - user_cate_cnt) \
                       + (len(self.item_feature_dict) - item_cate_cnt)
 
-        # ---------- PFE (可选) ----------
+        # ---------- PFE ----------
         if self.use_pfe:
             self.pfe = PFELayer(in_dim=hidden_size, num_proto=pfe_proto_num, temp=pfe_temp)
             print(f"[AdaTT] PFE enabled: proto_num={pfe_proto_num}, temp={pfe_temp}")
 
-        # ---------- Task-Specific Experts ----------
-        # 每个任务有自己的experts
-        self.task_experts = nn.ParameterList([
-            nn.Parameter(torch.empty(hidden_size, mmoe_hidden_dim, n_expert_per_task))
-            for _ in range(num_task)
-        ])
-        self.task_experts_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(mmoe_hidden_dim, n_expert_per_task))
-            for _ in range(num_task)
-        ])
+        # ---------- 多层Task-Specific Experts (双层MLP) ----------
+        fusion_dims = [hidden_size] + expert_dims  # [hidden_size, 256, 128]
         
-        for experts in self.task_experts:
-            nn.init.normal_(experts, mean=0.0, std=1.0)
+        self.task_experts = nn.ModuleList()
+        for level in range(num_fusion_levels):
+            level_experts = nn.ModuleList()
+            for task_id in range(num_task):
+                task_level_experts = nn.ModuleList()
+                for _ in range(n_expert_per_task):
+                    expert = ExpertNetwork(
+                        in_dim=fusion_dims[level],
+                        hidden_dim=fusion_dims[level+1] if level < len(fusion_dims)-2 else fusion_dims[level+1],
+                        out_dim=fusion_dims[level+1],
+                        activation=expert_activation
+                    )
+                    task_level_experts.append(expert)
+                level_experts.append(task_level_experts)
+            self.task_experts.append(level_experts)
 
-        # ---------- Shared Experts (可选) ----------
+        # ---------- Shared Experts ----------
         if n_shared_expert > 0:
-            self.shared_experts = nn.Parameter(
-                torch.empty(hidden_size, mmoe_hidden_dim, n_shared_expert)
-            )
-            self.shared_experts_bias = nn.Parameter(
-                torch.zeros(mmoe_hidden_dim, n_shared_expert)
-            )
-            nn.init.normal_(self.shared_experts, mean=0.0, std=1.0)
+            self.shared_experts = nn.ModuleList()
+            for level in range(num_fusion_levels):
+                level_shared = nn.ModuleList()
+                for _ in range(n_shared_expert):
+                    expert = ExpertNetwork(
+                        in_dim=fusion_dims[level],
+                        hidden_dim=fusion_dims[level+1],
+                        out_dim=fusion_dims[level+1],
+                        activation=expert_activation
+                    )
+                    level_shared.append(expert)
+                self.shared_experts.append(level_shared)
+            
+            # Shared unit的融合权重（非最后一层才用）
+            if num_fusion_levels > 1:
+                self.shared_fusion_weights = nn.ParameterList([
+                    nn.Parameter(torch.ones(n_shared_expert) / n_shared_expert)
+                    for _ in range(num_fusion_levels - 1)  # 最后一层不融合
+                ])
+            
             print(f"[AdaTT] Shared experts enabled: n_shared={n_shared_expert}")
         
-        # ---------- Gates (Task-to-Task Fusion核心) ----------
-        # 每个任务的gate看到所有experts
+        # ---------- Gates ----------
         total_experts = num_task * n_expert_per_task + n_shared_expert
         
-        self.gates = nn.ParameterList([
-            nn.Parameter(torch.empty(hidden_size, total_experts))
-            for _ in range(num_task)
-        ])
-        self.gates_bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(total_experts))
-            for _ in range(num_task)
-        ])
-        for p in self.gates:
-            nn.init.normal_(p, mean=0.0, std=1.0)
+        self.gates = nn.ModuleList()
+        for level in range(num_fusion_levels):
+            level_gates = nn.ModuleList()
+            for _ in range(num_task):
+                gate_net = nn.Linear(fusion_dims[level], total_experts)
+                level_gates.append(gate_net)
+            self.gates.append(level_gates)
 
-        # ---------- Native Expert Weights (AdaTT Equation 8) ----------
-        self.native_weights = nn.ParameterList([
-            nn.Parameter(torch.ones(n_expert_per_task) / n_expert_per_task)
-            for _ in range(num_task)
-        ])
+        # ---------- Native Expert Weights ----------
+        self.native_weights = nn.ParameterList()
+        for level in range(num_fusion_levels):
+            level_weights = nn.ParameterList()
+            for _ in range(num_task):
+                weight = nn.Parameter(torch.ones(n_expert_per_task) / n_expert_per_task)
+                level_weights.append(weight)
+            self.native_weights.append(level_weights)
 
         print(f"[AdaTT] Architecture:")
-        print(f"  - Task-specific experts: {n_expert_per_task} per task")
-        print(f"  - Shared experts: {n_shared_expert}")
-        print(f"  - Total experts visible to each gate: {total_experts}")
+        print(f"  - Fusion levels: {num_fusion_levels}")
+        print(f"  - Expert dims: {expert_dims}")
+        print(f"  - Task-specific experts: {n_expert_per_task} per task per level")
+        print(f"  - Total experts per level: {total_experts}")
         print(f"  - Gate: type={self.gate_type}, tau={self.gate_tau}")
-        print(f"  - Task-to-Task Fusion: Enabled (每个任务可看到所有experts)")
 
         # ---------- Task Towers ----------
+        final_dim = fusion_dims[-1]
         for i in range(self.num_task):
             tower = nn.ModuleList()
-            dims = [mmoe_hidden_dim] + list(hidden_dim)
+            dims = [final_dim] + list(hidden_dim)
             for j in range(len(dims) - 1):
                 tower.add_module(f"linear_{j}", nn.Linear(dims[j], dims[j + 1]))
                 tower.add_module(f"bn_{j}", nn.BatchNorm1d(dims[j + 1]))
@@ -192,10 +212,9 @@ class AdaTT(nn.Module):
             tower.add_module("head", nn.Linear(dims[-1], output_size))
             setattr(self, f"task_{i+1}_dnn", tower)
 
-        # ---------- ResFlow (我们的创新) ----------
+        # ---------- ResFlow ----------
         if self.use_resflow:
-            residual_dim = res_dim or mmoe_hidden_dim
-            # 为 task2..taskK 各建一个 residual learner
+            residual_dim = res_dim or final_dim
             self.res_mlps = nn.ModuleList([
                 nn.Sequential(
                     nn.Linear(residual_dim, residual_dim, bias=False),
@@ -210,11 +229,10 @@ class AdaTT(nn.Module):
                 ])
             else:
                 self.res_norms = None
-            
-            print(f"[AdaTT] ResFlow enabled: dim={residual_dim}, norm={res_use_norm}, detach={res_detach}")
+            print(f"[AdaTT] ResFlow enabled: dim={residual_dim}, norm={res_use_norm}")
 
     def _build_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        """组装embedding -> (B, hidden_size)"""
+        """组装embedding"""
         user_embs, item_embs = [], []
 
         for feat, (voc_size, col) in self.user_feature_dict.items():
@@ -242,81 +260,94 @@ class AdaTT(nn.Module):
         return hidden.float()
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """
-        前向传播
-        Returns: List[torch.Tensor] 每个任务的输出
-        """
         assert x.size(1) == len(self.user_feature_dict) + len(self.item_feature_dict)
 
         # 1) Build hidden
         hidden = self._build_hidden(x)
 
-        # 2) PFE (可选)
+        # 2) PFE
         if self.use_pfe:
             hidden = self.pfe(hidden)
 
-        # 3) 构建所有experts的输出
-        all_experts_list = []
+        # 3) 多层融合
+        task_outputs_per_level = [hidden] * self.num_task
+        shared_output = hidden  # 追踪shared unit的输出
         
-        # 每个任务的task-specific experts
-        for t in range(self.num_task):
-            task_expert_out = torch.einsum('ij, jkl -> ikl', hidden, self.task_experts[t])
-            task_expert_out = task_expert_out + self.task_experts_bias[t]
-            if self.expert_activation is not None:
-                task_expert_out = self.expert_activation(task_expert_out)
-            all_experts_list.append(task_expert_out)
-        
-        # Shared experts (如果有)
-        if self.n_shared_expert > 0:
-            shared_expert_out = torch.einsum('ij, jkl -> ikl', hidden, self.shared_experts)
-            shared_expert_out = shared_expert_out + self.shared_experts_bias
-            if self.expert_activation is not None:
-                shared_expert_out = self.expert_activation(shared_expert_out)
-            all_experts_list.append(shared_expert_out)
-        
-        # 拼接所有experts: (B, mmoe_hidden_dim, total_experts)
-        all_experts = torch.cat(all_experts_list, dim=2)
-
-        # 4) Task-to-Task Fusion (AdaTT核心)
-        fused_list = []
-        for t in range(self.num_task):
-            # AllExpertGF: Gate融合所有experts (Equation 9)
-            if not self.ablation_no_allexpert:
-                gate_w = self.gates[t]
-                gate_b = self.gates_bias[t]
-                logits = torch.einsum('ab, bc -> ac', hidden, gate_w) + gate_b
+        for level in range(self.num_fusion_levels):
+            # 3.1) 计算所有experts
+            all_experts_list = []
+            
+            # Task-specific experts
+            for t in range(self.num_task):
+                task_input = task_outputs_per_level[t]
+                for expert in self.task_experts[level][t]:
+                    expert_out = expert(task_input)
+                    all_experts_list.append(expert_out.unsqueeze(2))
+            
+            # Shared experts (用上一层的shared_output)
+            shared_experts_out = []
+            if self.n_shared_expert > 0:
+                for expert in self.shared_experts[level]:
+                    expert_out = expert(shared_output)
+                    all_experts_list.append(expert_out.unsqueeze(2))
+                    shared_experts_out.append(expert_out.unsqueeze(2))
+            
+            # 拼接: (B, out_dim, total_experts)
+            all_experts = torch.cat(all_experts_list, dim=2)
+            
+            # 3.2) 更新shared_output（非最后一层才融合）
+            if self.n_shared_expert > 0 and level < self.num_fusion_levels - 1:
+                # 融合shared experts（简单加权平均）
+                shared_experts_cat = torch.cat(shared_experts_out, dim=2)  # (B, out_dim, n_shared)
+                shared_output = torch.einsum('bde, e -> bd', 
+                                            shared_experts_cat, 
+                                            self.shared_fusion_weights[level])
+            elif self.n_shared_expert > 0 and level == self.num_fusion_levels - 1:
+                # 最后一层：shared unit不融合，直接传给下一层
+                # 这里可以简单取平均或第一个expert
+                shared_output = torch.cat(shared_experts_out, dim=2).mean(dim=2)
+            
+            # 3.3) Task-to-Task Fusion
+            fused_list = []
+            for t in range(self.num_task):
+                task_input = task_outputs_per_level[t]
                 
-                if self.gate_type == 'sigmoid':
-                    gate_out = torch.sigmoid(logits / self.gate_tau)
+                # AllExpertGF
+                if not self.ablation_no_allexpert:
+                    logits = self.gates[level][t](task_input)
+                    if self.gate_type == 'sigmoid':
+                        gate_out = torch.sigmoid(logits / self.gate_tau)
+                    else:
+                        gate_out = F.softmax(logits / self.gate_tau, dim=-1)
+                    gate_out = gate_out.unsqueeze(1)
+                    all_expert_fusion = (all_experts * gate_out).sum(dim=2)
                 else:
-                    gate_out = F.softmax(logits / self.gate_tau, dim=-1)
+                    all_expert_fusion = 0
                 
-                gate_out = gate_out.unsqueeze(1)  # (B, 1, total_experts)
-                all_expert_fusion = (all_experts * gate_out).sum(dim=2)  # (B, mmoe_hidden_dim)
-            else:
-                all_expert_fusion = 0
+                # NativeExpertLF
+                if not self.ablation_no_native:
+                    start_idx = t * self.n_expert_per_task
+                    end_idx = start_idx + self.n_expert_per_task
+                    native_experts = all_experts[:, :, start_idx:end_idx]
+                    native_fusion = torch.einsum('bde, e -> bd', native_experts, 
+                                                self.native_weights[level][t])
+                else:
+                    native_fusion = 0
+                
+                fused = all_expert_fusion + native_fusion
+                fused_list.append(fused)
             
-            # NativeExpertLF: 线性融合自己的native experts (Equation 8)
-            if not self.ablation_no_native:
-                start_idx = t * self.n_expert_per_task
-                end_idx = start_idx + self.n_expert_per_task
-                native_experts = all_experts[:, :, start_idx:end_idx]
-                native_fusion = torch.einsum('bde, e -> bd', native_experts, self.native_weights[t])
-            else:
-                native_fusion = 0
-            
-            # 残差连接 (Equation 7)
-            fused = all_expert_fusion + native_fusion
-            fused_list.append(fused)
+            # 更新下一层的输入
+            task_outputs_per_level = fused_list
 
-        # 5) ResFlow + Task Towers
+        # 4) ResFlow + Task Towers
         task_outputs = []
         prev_h = None
         
         for i in range(self.num_task):
-            h = fused_list[i]
+            h = task_outputs_per_level[i]
 
-            # ResFlow: 跨任务残差信息流 (我们的创新)
+            # ResFlow
             if self.use_resflow and i > 0 and prev_h is not None:
                 input_h = prev_h.detach() if self.res_detach else prev_h
                 residual = self.res_mlps[i - 1](input_h)
@@ -335,9 +366,9 @@ class AdaTT(nn.Module):
         return task_outputs
 
     def get_config(self) -> dict:
-        """返回模型配置"""
         return {
-            'architecture': 'AdaTT + ResFlow + CoGrad',
+            'architecture': 'AdaTT (Full Implementation)',
+            'num_fusion_levels': self.num_fusion_levels,
             'use_pfe': self.use_pfe,
             'gate_type': self.gate_type,
             'gate_tau': self.gate_tau,
@@ -345,7 +376,4 @@ class AdaTT(nn.Module):
             'num_task': self.num_task,
             'n_expert_per_task': self.n_expert_per_task,
             'n_shared_expert': self.n_shared_expert,
-            'mmoe_hidden_dim': self.mmoe_hidden_dim,
-            'ablation_no_native': self.ablation_no_native,
-            'ablation_no_allexpert': self.ablation_no_allexpert,
         }

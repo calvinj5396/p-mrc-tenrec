@@ -69,6 +69,7 @@ class MMOE(nn.Module):
         pfe_proto_num: int = 4,
         pfe_temp: float = 1.0,
         use_resflow: bool = True,
+        gate_type: str = 'sigmoid',       # ✅ 新增：'sigmoid' 或 'softmax'
         gate_tau: float = 1.0,        # AdaTT 温度，=1 等价普通 Sigmoid
         res_dim: Optional[int] = None # ResFlow 维度(默认= mmoe_hidden_dim)
     ):
@@ -206,7 +207,11 @@ class MMOE(nn.Module):
             # logits: (B, E)
             logits = torch.einsum('ab, bc -> ac', hidden, gate_w) + gate_b
             # Sigmoid + 温度（温度越小，越“硬”）
-            gate_out = torch.sigmoid(logits / self.gate_tau)        # (B, E)
+            # ✅ 根据gate_type选择激活函数
+            if self.gate_type == 'sigmoid':
+                gate_out = torch.sigmoid(logits / self.gate_tau)
+            else:  # softmax
+                gate_out = F.softmax(logits / self.gate_tau, dim=-1)
             gate_out = gate_out.unsqueeze(1)                        # (B, 1, E) for broadcast
             fused = (experts_out * gate_out).sum(dim=2)             # (B, mmoe_hidden_dim)
             fused_list.append(fused)

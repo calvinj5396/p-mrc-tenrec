@@ -16,34 +16,116 @@ base_cmd = [
 ]
 
 experiments = [
+    # ========== MMOE消融 ==========
     {
-        "name": "E0-MMOE",
-        "args": ["--seed", "100", "--model_name", "mmoe", "--n_expert", "4",
-                 "--pfe_use", "false", "--gamma1", "0.0", "--gamma2", "0.0"]
+        "name": "E0-MMOE-Baseline",
+        "args": [
+            "--seed", "100", "--model_name", "mmoe", "--n_expert", "4",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "false", "--use_resflow", "false",
+            "--gamma1", "0.0", "--gamma2", "0.0"
+        ]
     },
     {
-        "name": "E1-AdaTT-Only",
-        "args": ["--seed", "100", "--model_name", "adatt", "--n_expert_per_task", "2",
-                 "--n_shared_expert", "0", "--pfe_use", "false", "--use_resflow", "false",
-                 "--gamma1", "0.0", "--gamma2", "0.0"]
+        "name": "E0.1-MMOE+ResFlow",
+        "args": [
+            "--seed", "100", "--model_name", "mmoe", "--n_expert", "4",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "false", "--use_resflow", "true",
+            "--gamma1", "0.0", "--gamma2", "0.0"
+        ]
     },
     {
-        "name": "E2-AdaTT-ResFlow",
-        "args": ["--seed", "100", "--model_name", "adatt", "--n_expert_per_task", "2",
-                 "--n_shared_expert", "0", "--pfe_use", "false", "--use_resflow", "true",
-                 "--gamma1", "0.0", "--gamma2", "0.0"]
+        "name": "E0.2-MMOE+ResFlow+PFE",
+        "args": [
+            "--seed", "100", "--model_name", "mmoe", "--n_expert", "4",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "true", "--pfe_proto_num", "4", "--pfe_temp", "0.3",
+            "--use_resflow", "true",
+            "--gamma1", "0.0", "--gamma2", "0.0"
+        ]
     },
     {
-        "name": "E3-Full-NoCoGrad",
-        "args": ["--seed", "100", "--model_name", "adatt", "--n_expert_per_task", "2",
-                 "--n_shared_expert", "0", "--pfe_use", "false", "--use_resflow", "true",
-                 "--gamma1", "0.1", "--gamma2", "0.1"]
+        "name": "E0.3-MMOE-Full-Softmax",
+        "args": [
+            "--seed", "100", "--model_name", "mmoe", "--n_expert", "4",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "true", "--pfe_proto_num", "4", "--pfe_temp", "0.3",
+            "--use_resflow", "true",
+            "--gamma1", "0.1", "--gamma2", "0.1"
+        ]
+    },
+    
+    # ========== AdaTT消融 ==========
+    {
+        "name": "E1-AdaTT-Baseline",
+        "args": [
+            "--seed", "100", "--model_name", "adatt", 
+            "--n_expert_per_task", "2", "--n_shared_expert", "0",
+            "--expert_dims", "256", "128", "--num_fusion_levels", "2",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "false", "--use_resflow", "false",
+            "--gamma1", "0.0", "--gamma2", "0.0"
+        ]
     },
     {
-        "name": "E4-Full",
-        "args": ["--seed", "100", "--model_name", "adatt", "--n_expert_per_task", "2",
-                 "--n_shared_expert", "0", "--pfe_use", "true", "--pfe_proto_num", "4",
-                 "--pfe_temp", "0.3", "--use_resflow", "true", "--gamma1", "0.1", "--gamma2", "0.1"]
+        "name": "E2-AdaTT+ResFlow",
+        "args": [
+            "--seed", "100", "--model_name", "adatt",
+            "--n_expert_per_task", "2", "--n_shared_expert", "0",
+            "--expert_dims", "256", "128", "--num_fusion_levels", "2",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "false", "--use_resflow", "true",
+            "--gamma1", "0.0", "--gamma2", "0.0"
+        ]
+    },
+    {
+        "name": "E3-AdaTT+ResFlow+PFE",
+        "args": [
+            "--seed", "100", "--model_name", "adatt",
+            "--n_expert_per_task", "2", "--n_shared_expert", "0",
+            "--expert_dims", "256", "128", "--num_fusion_levels", "2",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "true", "--pfe_proto_num", "4", "--pfe_temp", "0.3",
+            "--use_resflow", "true",
+            "--gamma1", "0.0", "--gamma2", "0.0"
+        ]
+    },
+    {
+        "name": "E4-AdaTT-Full-Softmax",
+        "args": [
+            "--seed", "100", "--model_name", "adatt",
+            "--n_expert_per_task", "2", "--n_shared_expert", "0",
+            "--expert_dims", "256", "128", "--num_fusion_levels", "2",
+            "--gate_type", "softmax", "--gate_tau", "1.0",
+            "--pfe_use", "true", "--pfe_proto_num", "4", "--pfe_temp", "0.3",
+            "--use_resflow", "true",
+            "--gamma1", "0.1", "--gamma2", "0.1"
+        ]
+    },
+    
+    # ========== Gate类型对比 ==========
+    {
+        "name": "E5-AdaTT-Full-Sigmoid",
+        "args": [
+            "--seed", "100", "--model_name", "adatt",
+            "--n_expert_per_task", "2", "--n_shared_expert", "0",
+            "--expert_dims", "256", "128", "--num_fusion_levels", "2",
+            "--gate_type", "sigmoid", "--gate_tau", "0.5",
+            "--pfe_use", "true", "--pfe_proto_num", "4", "--pfe_temp", "0.3",
+            "--use_resflow", "true",
+            "--gamma1", "0.1", "--gamma2", "0.1"
+        ]
+    },
+    {
+        "name": "E6-MMOE-Full-Sigmoid",
+        "args": [
+            "--seed", "100", "--model_name", "mmoe", "--n_expert", "4",
+            "--gate_type", "sigmoid", "--gate_tau", "0.5",  # sigmoid gate
+            "--pfe_use", "true", "--pfe_proto_num", "4", "--pfe_temp", "0.3",
+            "--use_resflow", "true",
+            "--gamma1", "0.1", "--gamma2", "0.1"
+        ]
     },
 ]
 

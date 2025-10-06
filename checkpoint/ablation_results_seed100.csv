@@ -1,1 +1,2 @@
 exp_name,model_name,use_pfe,use_resflow,gamma1,gamma2,gate_type,gate_tau,n_expert_per_task,n_shared_expert,best_val_loss,test_click_auc,test_like_auc,ablation_no_native,ablation_no_allexpert,timestamp
+MMOE+ResFlow+PFE(K=4),mmoe,True,True,0.0,0.0,softmax,1.0,2,0,0.572981,0.792002,0.919292,False,False,2025-10-06 04:01:44

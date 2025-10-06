@@ -25,6 +25,7 @@ from model.ctr.din import DIN
 from model.transfer_learning.peterrec import PeterRec
 from model.mtl.esmm import ESMM
 from model.mtl.mmoe import MMOE
+from model.mtl.adatt import AdaTT
 from model.model_accelerate.stackrec import StackRec
 from model.model_compression.cprec import CpRec
 from model.inference_acceleration.skiprec import SkipRec, PolicyNetGumbel
@@ -494,29 +495,47 @@ if __name__ == "__main__":
 
     #SASRec
     parser.add_argument('--l2_emb', default=0.0, type=float)
-    #mtl
-    parser.add_argument('--mtl_task_num', type=int, default=1, help='0:like, 1:click, 2:two tasks')
+    # ========== 通用MTL参数 ==========
+    parser.add_argument('--mtl_task_num', type=int, default=1, 
+                        help='0:like, 1:click, 2:two tasks')
     
-    # 添加 PFE 相关参数
-    parser.add_argument('--n_expert_per_task', type=int, default=2, 
-                        help='Number of experts per task')
-    parser.add_argument('--n_shared_expert', type=int, default=0, 
-                        help='Number of shared experts (0 for AdaTT-sp)')
+    # ========== 通用增强模块（MMOE和AdaTT都用）==========
+    parser.add_argument('--pfe_use', 
+                    type=lambda x: x.lower() == 'true', 
+                    default=True, help='Whether to use PFE')
+    parser.add_argument('--pfe_proto_num', type=int, default=4, 
+                        help='Number of prototype centers')
+    parser.add_argument('--pfe_temp', type=float, default=0.3, 
+                        help='Temperature for PFE')
+    parser.add_argument('--use_resflow', type=lambda x: x.lower() == 'true', default=True,
+                        help='Enable ResFlow')
+    
+    # ========== Gate配置（MMOE和AdaTT都用）==========
     parser.add_argument('--gate_type', type=str, default='softmax', 
                         choices=['softmax', 'sigmoid'],
                         help='Gate activation type')
     parser.add_argument('--gate_tau', type=float, default=1.0, 
                         help='Temperature for gate')
-    parser.add_argument('--use_resflow', type=lambda x: x.lower() == 'true', default=True,
-                        help='Enable ResFlow (our innovation)')
+    
+    # ========== MMOE专用 ==========
+    parser.add_argument('--n_expert', type=int, default=2, 
+                        help='Number of experts for MMOE')
+    
+    # ========== AdaTT专用 ==========
+    parser.add_argument('--n_expert_per_task', type=int, default=2, 
+                        help='Number of experts per task (AdaTT)')
+    parser.add_argument('--n_shared_expert', type=int, default=0, 
+                        help='Number of shared experts (AdaTT, 0 for AdaTT-sp)')
+    parser.add_argument('--expert_dims', type=int, nargs='+', default=[256, 128],
+                        help='Expert dimensions for AdaTT (e.g., 256 128)')
+    parser.add_argument('--num_fusion_levels', type=int, default=2,
+                        help='Number of fusion levels (AdaTT)')
+    
+    # ========== 消融实验（AdaTT专用）==========
     parser.add_argument('--ablation_no_native', type=lambda x: x.lower() == 'true', default=False,
                         help='Ablation: disable NativeExpertLF')
     parser.add_argument('--ablation_no_allexpert', type=lambda x: x.lower() == 'true', default=False,
                         help='Ablation: disable AllExpertGF')
-    parser.add_argument('--pfe_use', type=bool, default=True, help='Whether to use PFE')
-    parser.add_argument('--pfe_proto_num', type=int, default=4, help='Number of prototype centers')
-    parser.add_argument('--pfe_temp', type=float, default=0.3, help='Temperature for PFE routing')
-    parser.add_argument('--n_expert', type=int, default=2, help='Number of shared experts')
 
     #CF
     parser.add_argument('--test_method', default='ufo', type=str)
@@ -669,31 +688,34 @@ if __name__ == "__main__":
             model = ESMM(user_feature_dict, item_feature_dict, emb_dim=args.embedding_size, num_task=num_task)
         elif args.model_name == 'adatt':
             model = AdaTT(
-                user_feature_dict, item_feature_dict,
-                emb_dim=args.embedding_size,
-                num_task=num_task,
-                n_expert_per_task=args.n_expert_per_task,
-                n_shared_expert=args.n_shared_expert,
-                use_pfe=args.pfe_use,
-                pfe_proto_num=args.pfe_proto_num,
-                pfe_temp=args.pfe_temp,
-                gate_type=args.gate_type,
-                gate_tau=args.gate_tau,
-                use_resflow=args.use_resflow,
-                ablation_no_native=args.ablation_no_native,
-                ablation_no_allexpert=args.ablation_no_allexpert,
-            )
-        else:
-             model = MMOE(
             user_feature_dict, item_feature_dict,
             emb_dim=args.embedding_size,
             num_task=num_task,
-            n_expert=args.n_expert,              # 从 args 读取
-            use_pfe=args.pfe_use,                # 从 args 读取
-            pfe_proto_num=args.pfe_proto_num,    # 从 args 读取
-            pfe_temp=args.pfe_temp,              # 从 args 读取
-            use_resflow=True,
-            gate_tau=1.0,
+            n_expert_per_task=args.n_expert_per_task,
+            n_shared_expert=args.n_shared_expert,
+            expert_dims=args.expert_dims,         # ✅ 新增
+            num_fusion_levels=args.num_fusion_levels,  # ✅ 新增
+            use_pfe=args.pfe_use,
+            pfe_proto_num=args.pfe_proto_num,
+            pfe_temp=args.pfe_temp,
+            gate_type=args.gate_type,
+            gate_tau=args.gate_tau,
+            use_resflow=args.use_resflow,
+            ablation_no_native=args.ablation_no_native,
+            ablation_no_allexpert=args.ablation_no_allexpert,
+        )
+        else:
+            model = MMOE(
+            user_feature_dict, item_feature_dict,
+            emb_dim=args.embedding_size,
+            num_task=num_task,
+            n_expert=args.n_expert,
+            use_pfe=args.pfe_use,
+            pfe_proto_num=args.pfe_proto_num,
+            pfe_temp=args.pfe_temp,
+            use_resflow=args.use_resflow,    # ✅ 改：从args读取
+            gate_type=args.gate_type,        # ✅ 新增：从args读取
+            gate_tau=args.gate_tau,          # ✅ 改：从args读取
         )
 
     
