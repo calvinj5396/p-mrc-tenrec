@@ -363,11 +363,6 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
 
-    # DDP 结束清理
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
         
         with torch.no_grad():
             local_loss_sum = torch.tensor([0.0], device=device)
