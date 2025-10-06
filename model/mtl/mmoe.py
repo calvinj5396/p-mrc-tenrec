@@ -86,6 +86,7 @@ class MMOE(nn.Module):
         self.expert_activation = expert_activation
         self.use_pfe = use_pfe
         self.use_resflow = use_resflow
+        self.gate_type = gate_type.lower()
         self.gate_tau = gate_tau
 
         # ---------- Embedding 初始化 ----------
