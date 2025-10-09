@@ -429,10 +429,6 @@ def set_seed(seed, re=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gamma1', type=float, default=0.1,
-                    help='CoGrad gamma for task-1')
-    parser.add_argument('--gamma2', type=float, default=0.1,
-                        help='CoGrad gamma for task-2')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--task_name', default='')
     parser.add_argument('--task_num', type=int, default=4)
@@ -498,7 +494,17 @@ if __name__ == "__main__":
     # ========== 通用MTL参数 ==========
     parser.add_argument('--mtl_task_num', type=int, default=1, 
                         help='0:like, 1:click, 2:two tasks')
-    
+    # ========== CoGrad 参数（多任务优化）==========
+    parser.add_argument('--use_cograd', type=lambda x: x.lower() == 'true', default=False,
+                        help='Whether to use CoGrad for MTL optimization')
+    parser.add_argument('--w1', type=float, default=1.0, 
+                        help='Weight for task 1 (click)')
+    parser.add_argument('--w2', type=float, default=1.0, 
+                        help='Weight for task 2 (like/conversion)')
+    parser.add_argument('--gamma1', type=float, default=0.01, 
+                        help='Gamma coefficient for task 1 CoGrad')
+    parser.add_argument('--gamma2', type=float, default=0.01, 
+                        help='Gamma coefficient for task 2 CoGrad')
     # ========== 通用增强模块（MMOE和AdaTT都用）==========
     parser.add_argument('--pfe_use', 
                     type=lambda x: x.lower() == 'true', 
@@ -516,6 +522,9 @@ if __name__ == "__main__":
                         help='Gate activation type')
     parser.add_argument('--gate_tau', type=float, default=1.0, 
                         help='Temperature for gate')
+    # 在参数解析中添加
+    parser.add_argument('--res_dim', type=int, default=None,
+                        help='Residual flow dimension (default: same as mmoe_hidden_dim)')
     
     # ========== MMOE专用 ==========
     parser.add_argument('--n_expert', type=int, default=2, 
@@ -716,6 +725,7 @@ if __name__ == "__main__":
             use_resflow=args.use_resflow,    # ✅ 改：从args读取
             gate_type=args.gate_type,        # ✅ 新增：从args读取
             gate_tau=args.gate_tau,          # ✅ 改：从args读取
+            res_dim = args.res_dim,
         )
 
     
@@ -812,6 +822,109 @@ if __name__ == "__main__":
                     print("\n✓ 可视化完成，图片已保存到:", args.save_path)
                 else:
                     print("❌ 未收集到PFE数据，请检查模型配置")
+                # main.py
+
+# main.py
+
+# ... 在 PFE 可视化之后 ...
+
+        # ========== ResFlow 可视化分析 ========== 
+        if is_rank0 and args.use_resflow:
+            print("\n" + "="*70)
+            print("  ResFlow Visualization Analysis")
+            print("="*70)
+            
+            # 当前模型就是 ResFlow 模型
+            resflow_model = model
+            resflow_model.eval()
+            
+            # 构建 baseline 模型文件路径
+            baseline_model_path = os.path.join(
+                args.save_path,
+                f"{args.task_name}_{args.model_name}_seed{args.seed}_best_model_{args.mtl_task_num}_baseline.pth"
+            )
+            
+            print(f"\n📦 Looking for baseline model at:")
+            print(f"   {baseline_model_path}")
+            
+            # 检查 Baseline 模型是否存在
+            if not os.path.exists(baseline_model_path):
+                print(f"\n⚠️  Baseline 模型不存在!")
+                print(f"   Expected: {baseline_model_path}")
+                print(f"\n💡 Troubleshooting:")
+                print(f"   1. 确保先运行了 baseline 实验（use_resflow=false）")
+                print(f"   2. 检查模型文件是否被正确重命名")
+                print(f"   3. 确认 seed 和 mtl_task_num 参数一致")
+                print(f"\n⏭️  跳过 ResFlow 可视化...\n")
+            else:
+                print(f"✅ Found baseline model!\n")
+                
+                # 加载 Baseline 模型
+                try:
+                    baseline_state = torch.load(baseline_model_path, map_location=args.device)
+                    
+                    # 创建一个新的 baseline 模型实例
+                    if args.model_name == 'mmoe':
+                        baseline_model = MMOE(
+                            user_feature_dict, item_feature_dict,
+                            emb_dim=args.embedding_size,
+                            num_task=num_task,
+                            n_expert=args.n_expert,
+                            use_pfe=args.pfe_use,
+                            pfe_proto_num=args.pfe_proto_num,
+                            pfe_temp=args.pfe_temp,
+                            use_resflow=False,  # ❌ Baseline 不用 ResFlow
+                            gate_type=args.gate_type,
+                            gate_tau=args.gate_tau,
+                            res_dim=args.res_dim,
+                        )
+                    elif args.model_name == 'adatt':                      
+                        baseline_model = AdaTT(
+                            user_feature_dict, item_feature_dict,
+                            emb_dim=args.embedding_size,
+                            num_task=num_task,
+                            n_expert_per_task=args.n_expert_per_task,
+                            n_shared_expert=args.n_shared_expert,
+                            expert_dims=args.expert_dims,
+                            num_fusion_levels=args.num_fusion_levels,
+                            use_pfe=args.pfe_use,
+                            pfe_proto_num=args.pfe_proto_num,
+                            pfe_temp=args.pfe_temp,
+                            gate_type=args.gate_type,
+                            gate_tau=args.gate_tau,
+                            use_resflow=False,  # ❌ Baseline 不用 ResFlow
+                        )
+                    else:
+                        print(f"⚠️  暂不支持 {args.model_name} 的 ResFlow 可视化")
+                        baseline_model = None
+                    
+                    if baseline_model is not None:
+                        baseline_model.load_state_dict(baseline_state)
+                        baseline_model = baseline_model.to(args.device)
+                        baseline_model.eval()
+                        
+                        print("✅ Baseline model loaded successfully!")
+                        
+                        # 导入可视化函数
+                        from visualize_resflow import visualize_resflow_features
+                        
+                        # 执行可视化
+                        visualize_resflow_features(
+                            resflow_model=resflow_model,
+                            baseline_model=baseline_model,
+                            test_dataloader=test_dataloader,
+                            args=args,
+                            num_samples=10
+                        )
+                        
+                        print("\n✅ ResFlow 可视化完成！")
+                        print(f"   📊 Feature heatmap: {args.save_path}/resflow_feature_heatmap.png")
+                        print(f"   📊 Residual logits: {args.save_path}/resflow_residual_logits.png")
+                
+                except Exception as e:
+                    print(f"\n❌ 加载或可视化失败: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
             
         if dist.is_available() and dist.is_initialized():
             dist.barrier()

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 import torch.distributed as dist
 from metrics import *
-from cograd_utils import get_shared_params, cograd_step   # <<< 新增
+from cograd_utils import get_shared_params
 import contextlib
 from utils import ResultLogger
 import torch.distributed as dist
@@ -18,7 +18,7 @@ import os, torch
 import torch.distributed as dist
 from torch.nn import functional as F
 import torch
-
+from cograd_utils import cograd_step_v2
 from tqdm import tqdm
 
 
@@ -53,7 +53,7 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             logger = ResultLogger(args.save_path, args.seed)
         except Exception:
             logger = None
-
+    
     # ================= 多任务 =================
     if args.mtl_task_num == 2 and train:
         model.train()
@@ -63,76 +63,101 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 train_loader.sampler.set_epoch(epoch)
             if is_dist() and hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
                 val_loader.sampler.set_epoch(epoch)
-
+            
             y1_true, y2_true, y1_pred, y2_pred = [], [], [], []
             total_loss, count = 0.0, 0
-
+            
             # 仅初始化一次共享参数引用（每个 epoch 刷新一次以防模型结构变化）
-            shared_params, _ = get_shared_params(model)
+            shared_params = get_shared_params(model)
             shared_params = [p for p in shared_params if p.requires_grad]
-
+            
             # 创建进度条
             pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=True, ncols=120) if is_rank0() else train_loader
-
+            
             for step, (x, y1, y2) in enumerate(pbar):
                 x = x.to(device, non_blocking=True)
                 y1 = y1.to(device, non_blocking=True)
                 y2 = y2.to(device, non_blocking=True)
-
-                # ======= CoGrad：单次 forward + 两次 backward（DDP下no_sync）=======
-                optimizer.zero_grad(set_to_none=True)
-
-                with (model.no_sync() if is_dist() else contextlib.nullcontext()):
+                
+                if args.use_cograd:
+                    # ======= CoGrad 流程 =======
+                    
+                    # 1) 第一次forward：用于获取梯度
                     out = model(x)
-
-                    # --- 任务1 backward：保留图，缓存共享层梯度 g1 ---
                     loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
-                    loss1.backward(retain_graph=True)
-
-                    task1_grads = {}
-                    for p in shared_params:
-                        if p.grad is not None:
-                            task1_grads[id(p)] = p.grad.detach().clone()
-
-                    # 清空“共享层”的梯度，仅为了拿到纯净的 g2（非共享层保持现状）
-                    for p in shared_params:
-                        p.grad = None
-
-                    # --- 任务2 backward：拿到共享层纯净梯度 g2 ---
                     loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
-                    loss2.backward()  # 仍在 no_sync 内
-
-                    task2_grads = {}
-                    for p in shared_params:
+                    
+                    # 2) 使用 autograd.grad 获取共享层的梯度
+                    g1 = torch.autograd.grad(
+                        loss1, shared_params, 
+                        retain_graph=True, 
+                        allow_unused=True,
+                        create_graph=False
+                    )
+                    g2 = torch.autograd.grad(
+                        loss2, shared_params, 
+                        retain_graph=False,  # 这里设为False，释放第一次forward的图
+                        allow_unused=True,
+                        create_graph=False
+                    )
+                    
+                    # 处理 None 值
+                    g1 = [torch.zeros_like(p) if gi is None else gi for gi, p in zip(g1, shared_params)]
+                    g2 = [torch.zeros_like(p) if gj is None else gj for gj, p in zip(g2, shared_params)]
+                    
+                    # 3) CoGrad 修正
+                    from cograd_utils import cograd_step_v2
+                    g_shared = cograd_step_v2(
+                        g1, g2, 
+                        gamma1=args.gamma1, 
+                        gamma2=args.gamma2,
+                        w1=args.w1,
+                        w2=args.w2
+                    )
+                    
+                    # 4) 第二次forward + backward（构建新的计算图）
+                    optimizer.zero_grad(set_to_none=True)
+                    out = model(x)  # 重新forward！
+                    loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
+                    loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
+                    total_loss_value = args.w1 * loss1 + args.w2 * loss2
+                    total_loss_value.backward()  # 现在可以正常backward了
+                    
+                    # 5) 覆盖共享层的 .grad 为 CoGrad 修正后的结果
+                    for p, g in zip(shared_params, g_shared):
                         if p.grad is not None:
-                            task2_grads[id(p)] = p.grad.detach().clone()
-
-                # --- CoGrad 投影：在共享层上重写 p.grad 为投影后的梯度 ---
-                cograd_step([task1_grads, task2_grads], shared_params, gammas=[args.gamma1, args.gamma2])
-
-                # DDP：对共享层梯度做平均（一次 all_reduce）
-                if is_dist():
-                    for p in shared_params:
-                        if p.grad is not None:
-                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-
-                # 更新参数（注意：非共享层此时保留的是“第二次 backward”的梯度，这与原先快版本一致）
+                            p.grad = g.to(p.dtype)
+                else:
+                    # ======= 标准 MTL 训练 =======
+                    out = model(x)
+                    loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
+                    loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
+                    
+                    optimizer.zero_grad(set_to_none=True)
+                    total_loss = args.w1 * loss1 + args.w2 * loss2
+                    total_loss.backward()
+                
+                # 6) 更新参数
                 optimizer.step()
-
-                # ======= 记录训练指标（不在 step 内算 AUC）=======
+                
+                # ======= 记录训练指标 =======
                 with torch.no_grad():
                     y1_true.extend(y1.squeeze().detach().cpu().numpy().tolist())
                     y2_true.extend(y2.squeeze().detach().cpu().numpy().tolist())
                     y1_pred.extend(out[0].squeeze().detach().cpu().numpy().tolist())
                     y2_pred.extend(out[1].squeeze().detach().cpu().numpy().tolist())
-
+                    
                     batch_loss = float((loss1 + loss2).item())
                     total_loss += batch_loss
                     count += 1
-
+                    
                     if is_rank0():
-                        pbar.set_postfix({'loss': f'{batch_loss:.4f}', 'avg_loss': f'{total_loss/max(count,1):.4f}'})
-
+                        pbar.set_postfix({
+                            'loss': f'{batch_loss:.4f}', 
+                            'avg_loss': f'{total_loss/max(count,1):.4f}'
+                        })
+            
+            # Epoch结束后计算AUC
             if is_rank0():
                 try:
                     click_auc = roc_auc_score(y1_true, y1_pred) if len(set(y1_true)) > 1 else 0.5
@@ -141,6 +166,9 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                     click_auc, like_auc = 0.5, 0.5
                 print(f"Epoch {epoch+1} train loss {total_loss / max(count,1):.4f}, "
                       f"click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
+            
+            
+            
 
             # ================= 验证（所有 rank 都跑） =================
             model.eval()
@@ -207,6 +235,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             model.train()
 
         # ================= 测试（所有 rank 都跑，rank0 汇总打印） =================
+        if is_dist():
+            dist.barrier()
         state = torch.load(save_path, map_location=device)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
@@ -359,6 +389,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 model.train()
 
         # ====== 测试（所有 rank 都跑，rank0 聚合打印）======
+        if is_dist():
+            dist.barrier()
         state = torch.load(save_path, map_location=device)
         (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.eval()
@@ -369,7 +401,8 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
             local_cnt      = torch.tensor([0],   device=device)
             y_test_true, y_test_pred = [], []
         
-            for x, y in test_loader:
+            test_iter = tqdm(test_loader, desc='Testing', ncols=100) if is_rank0() else test_loader
+            for x, y in test_iter:
                 x, y = x.to(device), y.to(device)
                 pred = model(x)
                 logits = pred[0] if isinstance(pred, (list, tuple)) else pred

@@ -144,9 +144,8 @@ class MMOE(nn.Module):
             # 为 task2..taskK 各建一个 residual learner
             self.res_mlps = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(residual_dim, residual_dim, bias=False),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(residual_dim, residual_dim, bias=False)
+                    nn.Linear(mmoe_hidden_dim, residual_dim, bias=False),
+                    nn.Linear(residual_dim, mmoe_hidden_dim, bias=False)
                 )
                 for _ in range(self.num_task - 1)
             ])

@@ -217,9 +217,8 @@ class AdaTT(nn.Module):
             residual_dim = res_dim or final_dim
             self.res_mlps = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(residual_dim, residual_dim, bias=False),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(residual_dim, residual_dim, bias=False)
+                    nn.Linear(final_dim, residual_dim, bias=False),
+                    nn.Linear(residual_dim, final_dim, bias=False)
                 )
                 for _ in range(self.num_task - 1)
             ])

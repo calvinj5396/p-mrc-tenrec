@@ -1,3 +1,16 @@
 exp_name,model_name,use_pfe,use_resflow,gamma1,gamma2,gate_type,gate_tau,n_expert_per_task,n_shared_expert,best_val_loss,test_click_auc,test_like_auc,ablation_no_native,ablation_no_allexpert,timestamp
 MMOE+ResFlow+PFE(K=4),mmoe,True,True,0.0,0.0,softmax,1.0,2,0,0.572981,0.792002,0.919292,False,False,2025-10-06 04:01:44
 MMOE,mmoe,False,False,0.0,0.0,softmax,1.0,2,0,0.575120,0.790579,0.918148,False,False,2025-10-06 16:04:28
+MMOE+ResFlow,mmoe,False,True,0.0,0.0,softmax,1.0,2,0,0.574895,0.790583,0.917582,False,False,2025-10-06 17:32:10
+MMOE+ResFlow+PFE(K=4),mmoe,True,True,0.0,0.0,softmax,1.0,2,0,0.572911,0.791948,0.918347,False,False,2025-10-06 19:03:51
+"MMOE+ResFlow+CoGrad(γ1=0.1,γ2=0.1)+PFE(K=4)",mmoe,True,True,0.1,0.1,softmax,1.0,2,0,0.573563,0.791902,0.917266,False,False,2025-10-06 20:34:49
+ADATT,adatt,False,False,0.0,0.0,softmax,1.0,2,0,0.571768,0.792544,0.919925,False,False,2025-10-06 22:20:21
+ADATT+ResFlow,adatt,False,True,0.0,0.0,softmax,1.0,2,0,0.571549,0.792531,0.919662,False,False,2025-10-07 00:03:38
+ADATT+ResFlow+PFE(K=4),adatt,True,True,0.0,0.0,softmax,1.0,2,0,0.573372,0.791955,0.918559,False,False,2025-10-07 01:51:00
+"ADATT+ResFlow+CoGrad(γ1=0.1,γ2=0.1)+PFE(K=4)",adatt,True,True,0.1,0.1,softmax,1.0,2,0,0.573372,0.791955,0.918559,False,False,2025-10-07 03:38:09
+"ADATT+ResFlow+CoGrad(γ1=0.1,γ2=0.1)+PFE(K=4)+Sigmoid(τ=0.5)",adatt,True,True,0.1,0.1,sigmoid,0.5,2,0,0.573282,0.791194,0.916989,False,False,2025-10-07 05:25:00
+"MMOE+ResFlow+CoGrad(γ1=0.003,γ2=0.001)+PFE(K=4)",mmoe,True,True,0.003,0.001,softmax,1.0,2,0,0.572185,0.792969,0.922275,False,False,2025-10-08 03:37:27
+"MMOE+ResFlow+CoGrad(γ1=0.01,γ2=0.01)+PFE(K=4)",mmoe,True,True,0.01,0.01,softmax,1.0,2,0,0.571566,0.792715,0.921656,False,False,2025-10-08 06:44:46
+"MMOE+CoGrad(γ1=0.01,γ2=0.01)",mmoe,False,False,0.01,0.01,softmax,1.0,2,0,0.635410,0.741169,0.820710,False,False,2025-10-10 00:06:35
+"MMOE+CoGrad(γ1=0.01,γ2=0.01)",mmoe,False,False,0.01,0.01,softmax,1.0,2,0,0.635410,0.741169,0.820710,False,False,2025-10-10 01:08:17
+"MMOE+ResFlow+CoGrad(γ1=0.01,γ2=0.01)",mmoe,False,True,0.01,0.01,softmax,1.0,2,0,0.636662,0.742630,0.806229,False,False,2025-10-10 01:28:24
