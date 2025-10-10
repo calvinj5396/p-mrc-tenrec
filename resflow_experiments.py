@@ -4,7 +4,7 @@ import subprocess
 import time
 
 base_cmd = [
-    "torchrun", "--nproc_per_node=2", "main.py",
+    "torchrun", "--nproc_per_node=1", "main.py",
     "--task_name", "mtl",
     "--dataset_path", "data/Tenrec/ctr_data_1M.csv",
     "--train_batch_size", "8192",

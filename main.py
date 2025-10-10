@@ -835,7 +835,8 @@ if __name__ == "__main__":
             print("="*70)
             
             # 当前模型就是 ResFlow 模型
-            resflow_model = model
+            raw_model = model.module if hasattr(model, 'module') else model
+            resflow_model = raw_model  # 使用解包后的模型
             resflow_model.eval()
             
             # 构建 baseline 模型文件路径
