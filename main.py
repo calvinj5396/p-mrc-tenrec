@@ -513,7 +513,7 @@ if __name__ == "__main__":
                         help='Number of prototype centers')
     parser.add_argument('--pfe_temp', type=float, default=0.3, 
                         help='Temperature for PFE')
-    parser.add_argument('--use_resflow', type=lambda x: x.lower() == 'true', default=True,
+    parser.add_argument('--use_resflow', type=lambda x: x.lower() == 'true', default=False,
                         help='Enable ResFlow')
     
     # ========== Gate配置（MMOE和AdaTT都用）==========
