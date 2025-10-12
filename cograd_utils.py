@@ -2,39 +2,35 @@ import torch
 import torch.nn as nn
 from typing import List, Tuple, Optional
 
-def get_shared_params(model):
+def get_shared_params(model) -> List[nn.Parameter]:
     """
-    获取 MMOE 共享层参数（experts / experts_bias / gates / gates_bias）。
-    DDP/DataParallel 下自动取 .module。
+    获取共享参数：除了 task-specific 层外的所有参数
     
-    Args:
-        model: PyTorch 模型
-        
-    Returns:
-        List[nn.Parameter]: 共享参数列表
+    采用排除法：
+    - 共享层 = 所有参数 - Tower层参数
+    - 包括: experts, gates, 所有 embeddings
+    - 排除: task_X_dnn (任务独立的塔)
     """
     m = model.module if hasattr(model, "module") else model
     params = []
     
-    # experts / experts_bias
-    for name in ("experts", "experts_bias"):
-        if hasattr(m, name):
-            p = getattr(m, name)
-            if isinstance(p, nn.Parameter) and p.requires_grad:
-                params.append(p)
+    # Task-specific 关键字
+    tower_keywords = ["task_1_dnn", "task_2_dnn", "task_3_dnn", "tower"]
     
-    # gates / gates_bias: ParameterList
-    if hasattr(m, "gates"):
-        for p in m.gates:
-            if isinstance(p, nn.Parameter) and p.requires_grad:
-                params.append(p)
+    for name, param in m.named_parameters():
+        # 排除 tower 层
+        is_tower = any(kw in name for kw in tower_keywords)
+        
+        if not is_tower and param.requires_grad:
+            params.append(param)
     
-    if hasattr(m, "gates_bias"):
-        for p in m.gates_bias:
-            if isinstance(p, nn.Parameter) and p.requires_grad:
-                params.append(p)
+    print(f"\n🔥 CoGrad 共享参数统计:")
+    print(f"   • 参数数量: {len(params)}")
+    print(f"   • 总元素数: {sum(p.numel() for p in params):,}")
+    print(f"   • 覆盖率: {sum(p.numel() for p in params) / sum(p.numel() for p in m.parameters()) * 100:.2f}%\n")
     
     return params
+
 
 
 # 注意：下面这个函数现在不需要了，因为我们在训练循环里直接做CoGrad修正

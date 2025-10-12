@@ -227,7 +227,7 @@ class MMOE(nn.Module):
                 # residual = self.res_norms[i - 1](residual)       # 如需更稳，可放开
                 h = h + residual
 
-            prev_h = h.detach()
+            prev_h = h
 
             # task-specific tower
             tower: nn.ModuleList = getattr(self, f"task_{i+1}_dnn")

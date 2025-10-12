@@ -79,33 +79,33 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 y1 = y1.to(device, non_blocking=True)
                 y2 = y2.to(device, non_blocking=True)
                 
+                # ============ 前向传播（两个分支共用） ============
+                out = model(x)
+                loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
+                loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
+                
                 if args.use_cograd:
-                    # ======= CoGrad 流程 =======
+                    # ========== CoGrad流程 ==========
                     
-                    # 1) 第一次forward：用于获取梯度
-                    out = model(x)
-                    loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
-                    loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
-                    
-                    # 2) 使用 autograd.grad 获取共享层的梯度
+                    # 1. 计算共享层梯度
                     g1 = torch.autograd.grad(
                         loss1, shared_params, 
-                        retain_graph=True, 
+                        retain_graph=True,
                         allow_unused=True,
                         create_graph=False
                     )
                     g2 = torch.autograd.grad(
                         loss2, shared_params, 
-                        retain_graph=False,  # 这里设为False，释放第一次forward的图
+                        retain_graph=True,  # ✅ 必须是True
                         allow_unused=True,
                         create_graph=False
                     )
                     
-                    # 处理 None 值
+                    # 2. 处理None值
                     g1 = [torch.zeros_like(p) if gi is None else gi for gi, p in zip(g1, shared_params)]
                     g2 = [torch.zeros_like(p) if gj is None else gj for gj, p in zip(g2, shared_params)]
                     
-                    # 3) CoGrad 修正
+                    # 3. CoGrad修正
                     from cograd_utils import cograd_step_v2
                     g_shared = cograd_step_v2(
                         g1, g2, 
@@ -115,61 +115,44 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                         w2=args.w2
                     )
                     
-                    # 4) 第二次forward + backward（构建新的计算图）
+                    # 4. 反向传播
                     optimizer.zero_grad(set_to_none=True)
-                    out = model(x)  # 重新forward！
-                    loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
-                    loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
-                    total_loss_value = args.w1 * loss1 + args.w2 * loss2
-                    total_loss_value.backward()  # 现在可以正常backward了
+                    loss_weighted = args.w1 * loss1 + args.w2 * loss2
+                    loss_weighted.backward()
                     
-                    # 5) 覆盖共享层的 .grad 为 CoGrad 修正后的结果
+                    # 5. 覆盖共享层梯度
                     for p, g in zip(shared_params, g_shared):
                         if p.grad is not None:
-                            p.grad = g.to(p.dtype)
+                            p.grad.copy_(g.to(p.dtype))
+                        else:
+                            p.grad = g.to(p.dtype).clone()
+                    
+                    # 6. 更新参数 ✅ 必须有！
+                    optimizer.step()
+                    
                 else:
-                    # ======= 标准 MTL 训练 =======
-                    out = model(x)
-                    loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
-                    loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
-                    
+                    # ========== 标准MTL流程 ==========
                     optimizer.zero_grad(set_to_none=True)
-                    total_loss = args.w1 * loss1 + args.w2 * loss2
-                    total_loss.backward()
+                    loss_weighted = args.w1 * loss1 + args.w2 * loss2
+                    loss_weighted.backward()
+                    optimizer.step()
+            
+            # ============ 记录指标（统一） ============
+            with torch.no_grad():
+                y1_true.extend(y1.squeeze().cpu().numpy().tolist())
+                y2_true.extend(y2.squeeze().cpu().numpy().tolist())
+                y1_pred.extend(out[0].squeeze().cpu().numpy().tolist())
+                y2_pred.extend(out[1].squeeze().cpu().numpy().tolist())
                 
-                # 6) 更新参数
-                optimizer.step()
+                batch_loss = float((loss1 + loss2).item())
+                total_loss += batch_loss
+                count += 1
                 
-                # ======= 记录训练指标 =======
-                with torch.no_grad():
-                    y1_true.extend(y1.squeeze().detach().cpu().numpy().tolist())
-                    y2_true.extend(y2.squeeze().detach().cpu().numpy().tolist())
-                    y1_pred.extend(out[0].squeeze().detach().cpu().numpy().tolist())
-                    y2_pred.extend(out[1].squeeze().detach().cpu().numpy().tolist())
-                    
-                    batch_loss = float((loss1 + loss2).item())
-                    total_loss += batch_loss
-                    count += 1
-                    
-                    if is_rank0():
-                        pbar.set_postfix({
-                            'loss': f'{batch_loss:.4f}', 
-                            'avg_loss': f'{total_loss/max(count,1):.4f}'
-                        })
-            
-            # Epoch结束后计算AUC
-            if is_rank0():
-                try:
-                    click_auc = roc_auc_score(y1_true, y1_pred) if len(set(y1_true)) > 1 else 0.5
-                    like_auc  = roc_auc_score(y2_true, y2_pred) if len(set(y2_true)) > 1 else 0.5
-                except Exception:
-                    click_auc, like_auc = 0.5, 0.5
-                print(f"Epoch {epoch+1} train loss {total_loss / max(count,1):.4f}, "
-                      f"click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
-            
-            
-            
-
+                if is_rank0():
+                    pbar.set_postfix({
+                        'loss': f'{batch_loss:.4f}', 
+                        'avg': f'{total_loss/count:.4f}'
+                    })
             # ================= 验证（所有 rank 都跑） =================
             model.eval()
             with torch.no_grad():

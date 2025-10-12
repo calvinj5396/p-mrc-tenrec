@@ -18,6 +18,3 @@ ADATT+ResFlow+PFE(K=4),adatt,True,True,0.0,0.0,softmax,1.0,2,0,0.573372,0.791955
 "MMOE+ResFlow+CoGrad(γ1=0.01,γ2=0.01)",mmoe,False,True,0.01,0.01,softmax,1.0,2,0,0.608764,0.765967,0.857395,False,False,2025-10-10 18:38:14
 "MMOE+ResFlow+CoGrad(γ1=0.01,γ2=0.01)",mmoe,False,True,0.01,0.01,softmax,1.0,2,0,0.573559,0.791888,0.917589,False,False,2025-10-10 20:10:46
 "MMOE+CoGrad(γ1=0.01,γ2=0.01)",mmoe,False,False,0.01,0.01,softmax,1.0,2,0,0.573582,0.791926,0.918893,False,False,2025-10-10 22:15:08
-"MMOE+CoGrad(γ1=0.01,γ2=0.01)+PFE(K=4)",mmoe,True,False,0.01,0.01,softmax,1.0,2,0,0.571541,0.792743,0.922084,False,False,2025-10-10 23:46:51
-"MMOE+CoGrad(γ1=0.003,γ2=0.001)",mmoe,False,False,0.003,0.001,softmax,1.0,2,0,0.573575,0.791870,0.918735,False,False,2025-10-11 01:40:23
-"MMOE+CoGrad(γ1=0.003,γ2=0.001)",mmoe,False,False,0.003,0.001,softmax,1.0,2,0,0.573622,0.791886,0.918386,False,False,2025-10-12 19:14:39

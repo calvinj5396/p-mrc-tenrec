@@ -354,7 +354,7 @@ class AdaTT(nn.Module):
                     residual = self.res_norms[i - 1](residual)
                 h = h + residual
 
-            prev_h = h if not self.res_detach else h.detach()
+            prev_h = h
 
             # Task tower
             tower = getattr(self, f"task_{i+1}_dnn")
