@@ -23,30 +23,30 @@ from tqdm import tqdm
 
 
 def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
-
+    
     def is_dist():
         return dist.is_available() and dist.is_initialized()
-
+    
     def is_rank0():
         return (not is_dist()) or (dist.get_rank() == 0)
-
+    
     def get_state_dict(m):
         return m.module.state_dict() if hasattr(m, "module") else m.state_dict()
-
+    
     device = args.device
     epochs = args.epochs
     best_eval_loss = float("inf")
-
+    
     save_path = os.path.join(
         args.save_path,
         f"{args.task_name}_{args.model_name}_seed{args.seed}_best_model_{args.mtl_task_num}.pth"
     )
     os.makedirs(args.save_path, exist_ok=True)
-
+    
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    # 初始化logger（只在rank0）
+    
+    # 初始化logger
     logger = None
     if is_rank0():
         try:
@@ -54,22 +54,33 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
         except Exception:
             logger = None
     
-    # ================= 多任务 =================
+    # ================= 多任务训练 =================
     if args.mtl_task_num == 2 and train:
         model.train()
+        if is_dist() and hasattr(model, 'module'):
+            model._set_static_graph()
+            if is_rank0():
+                print("✅ DDP静态图模式已启用")
+        # ✅ 获取共享参数（只获取一次）
+        from cograd_utils import get_shared_params
+        shared_params = get_shared_params(model)
+        shared_params = [p for p in shared_params if p.requires_grad]
+        
+        if is_rank0() and args.use_cograd:
+            print(f"\n{'='*60}")
+            print(f"🚀 使用 CoGrad 优化（冻结共享层方法）")
+            print(f"   gamma1={args.gamma1}, gamma2={args.gamma2}")
+            print(f"   w1={args.w1}, w2={args.w2}")
+            print(f"   共享参数数量: {len(shared_params)}")
+            print(f"{'='*60}\n")
+        
         for epoch in range(epochs):
-            # DDP 下保证 shuffle 一致
+            # DDP设置
             if is_dist() and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
-            if is_dist() and hasattr(val_loader, "sampler") and hasattr(val_loader.sampler, "set_epoch"):
-                val_loader.sampler.set_epoch(epoch)
             
             y1_true, y2_true, y1_pred, y2_pred = [], [], [], []
             total_loss, count = 0.0, 0
-            
-            # 仅初始化一次共享参数引用（每个 epoch 刷新一次以防模型结构变化）
-            shared_params = get_shared_params(model)
-            shared_params = [p for p in shared_params if p.requires_grad]
             
             # 创建进度条
             pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=True, ncols=120) if is_rank0() else train_loader
@@ -79,80 +90,114 @@ def mtlTrain(model, train_loader, val_loader, test_loader, args, train=True):
                 y1 = y1.to(device, non_blocking=True)
                 y2 = y2.to(device, non_blocking=True)
                 
-                # ============ 前向传播（两个分支共用） ============
+                # ============ 前向传播 ============
                 out = model(x)
                 loss1 = loss_fn(out[0], y1.unsqueeze(1).float())
                 loss2 = loss_fn(out[1], y2.unsqueeze(1).float())
                 
                 if args.use_cograd:
-                    # ========== CoGrad流程 ==========
+                    # ========== CoGrad优化流程（冻结共享层方法）==========
                     
-                    # 1. 计算共享层梯度
-                    g1 = torch.autograd.grad(
-                        loss1, shared_params, 
-                        retain_graph=True,
-                        allow_unused=True,
-                        create_graph=False
-                    )
-                    g2 = torch.autograd.grad(
-                        loss2, shared_params, 
-                        retain_graph=True,  # ✅ 必须是True
-                        allow_unused=True,
-                        create_graph=False
-                    )
-                    
-                    # 2. 处理None值
-                    g1 = [torch.zeros_like(p) if gi is None else gi for gi, p in zip(g1, shared_params)]
-                    g2 = [torch.zeros_like(p) if gj is None else gj for gj, p in zip(g2, shared_params)]
-                    
-                    # 3. CoGrad修正
-                    from cograd_utils import cograd_step_v2
-                    g_shared = cograd_step_v2(
-                        g1, g2, 
-                        gamma1=args.gamma1, 
-                        gamma2=args.gamma2,
-                        w1=args.w1,
-                        w2=args.w2
-                    )
-                    
-                    # 4. 反向传播
+                    # 📋 Step 1: 计算任务1在共享层的梯度
                     optimizer.zero_grad(set_to_none=True)
-                    loss_weighted = args.w1 * loss1 + args.w2 * loss2
-                    loss_weighted.backward()
+                    loss1.backward(retain_graph=True)
+                    task1_shared_grads = {
+                        id(p): p.grad.detach().clone() 
+                        for p in shared_params if p.grad is not None
+                    }
                     
-                    # 5. 覆盖共享层梯度
-                    for p, g in zip(shared_params, g_shared):
-                        if p.grad is not None:
-                            p.grad.copy_(g.to(p.dtype))
-                        else:
-                            p.grad = g.to(p.dtype).clone()
+                    # 📋 Step 2: 计算任务2在共享层的梯度
+                    optimizer.zero_grad(set_to_none=True)
+                    loss2.backward(retain_graph=True)
+                    task2_shared_grads = {
+                        id(p): p.grad.detach().clone() 
+                        for p in shared_params if p.grad is not None
+                    }
                     
-                    # 6. 更新参数 ✅ 必须有！
+                    # 📋 Step 3: CoGrad修正共享层梯度
+                    from cograd_utils import cograd_step_dict
+                    cograd_step_dict(
+                        [task1_shared_grads, task2_shared_grads],
+                        shared_params,
+                        gammas=[args.gamma1, args.gamma2],
+                        weights=[args.w1, args.w2]
+                    )
+                    
+                    # 📋 Step 4: 冻结共享层，计算任务特定层梯度
+                    for p in shared_params:
+                        p.requires_grad_(False)  # 🔥 关键：冻结共享层
+                    
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_total = args.w1 * loss1 + args.w2 * loss2
+                    loss_total.backward()  # 只计算任务塔的梯度
+                    
+                    for p in shared_params:
+                        p.requires_grad_(True)  # 解冻
+                    
+                    # 📋 Step 5: 更新所有参数
                     optimizer.step()
                     
+                    # 📊 可选：监控梯度信息
+                    if is_rank0() and step % 100 == 0:
+                        # 计算梯度统计
+                        g1_norms = [task1_shared_grads[id(p)].norm().item() for p in shared_params if id(p) in task1_shared_grads]
+                        g2_norms = [task2_shared_grads[id(p)].norm().item() for p in shared_params if id(p) in task2_shared_grads]
+                        
+                        avg_norm1 = sum(g1_norms) / len(g1_norms) if g1_norms else 0
+                        avg_norm2 = sum(g2_norms) / len(g2_norms) if g2_norms else 0
+                        
+                        # 计算余弦相似度
+                        cos_sims = []
+                        for p in shared_params:
+                            if id(p) in task1_shared_grads and id(p) in task2_shared_grads:
+                                g1 = task1_shared_grads[id(p)].flatten()
+                                g2 = task2_shared_grads[id(p)].flatten()
+                                cos = (g1 @ g2) / (g1.norm() * g2.norm() + 1e-8)
+                                cos_sims.append(cos.item())
+                        
+                        avg_cos = sum(cos_sims) / len(cos_sims) if cos_sims else 0
+                        
+                        print(f"\n[Step {step}] CoGrad Stats:")
+                        print(f"  Grad Norm - Task1: {avg_norm1:.4f}, Task2: {avg_norm2:.4f}")
+                        print(f"  Cosine Similarity: {avg_cos:.4f}")
+                
                 else:
                     # ========== 标准MTL流程 ==========
                     optimizer.zero_grad(set_to_none=True)
                     loss_weighted = args.w1 * loss1 + args.w2 * loss2
                     loss_weighted.backward()
                     optimizer.step()
+                
+                # ============ 记录指标 ============
+                with torch.no_grad():
+                    y1_true.extend(y1.cpu().numpy().tolist())
+                    y2_true.extend(y2.cpu().numpy().tolist())
+                    y1_pred.extend(torch.sigmoid(out[0]).squeeze().cpu().numpy().tolist())
+                    y2_pred.extend(torch.sigmoid(out[1]).squeeze().cpu().numpy().tolist())
+                    
+                    batch_loss = float((loss1 + loss2).item())
+                    total_loss += batch_loss
+                    count += 1
+                    
+                    if is_rank0():
+                        pbar.set_postfix({
+                            'loss': f'{batch_loss:.4f}',
+                            'avg': f'{total_loss/count:.4f}'
+                        })
             
-            # ============ 记录指标（统一） ============
-            with torch.no_grad():
-                y1_true.extend(y1.squeeze().cpu().numpy().tolist())
-                y2_true.extend(y2.squeeze().cpu().numpy().tolist())
-                y1_pred.extend(out[0].squeeze().cpu().numpy().tolist())
-                y2_pred.extend(out[1].squeeze().cpu().numpy().tolist())
-                
-                batch_loss = float((loss1 + loss2).item())
-                total_loss += batch_loss
-                count += 1
-                
-                if is_rank0():
-                    pbar.set_postfix({
-                        'loss': f'{batch_loss:.4f}', 
-                        'avg': f'{total_loss/count:.4f}'
-                    })
+            # Epoch结束后计算AUC
+            if is_rank0():
+                try:
+                    click_auc = roc_auc_score(y1_true, y1_pred) if len(set(y1_true)) > 1 else 0.5
+                    like_auc  = roc_auc_score(y2_true, y2_pred) if len(set(y2_true)) > 1 else 0.5
+                except Exception:
+                    click_auc, like_auc = 0.5, 0.5
+                print(f"Epoch {epoch+1} train loss {total_loss / max(count,1):.4f}, "
+                      f"click AUC {click_auc:.4f}, like AUC {like_auc:.4f}")
+            
+            
+            
+
             # ================= 验证（所有 rank 都跑） =================
             model.eval()
             with torch.no_grad():

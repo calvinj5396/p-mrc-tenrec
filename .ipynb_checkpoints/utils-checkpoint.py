@@ -1393,7 +1393,15 @@ def get_train_loader(dataset, args):
             pin_memory=True,
         )
     else:
-        return DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True, pin_memory=True)
+        return DataLoader(
+            dataset, 
+            batch_size=args.train_batch_size, 
+            shuffle=True, 
+            num_workers=4,           # ✅ Step 1
+            pin_memory=True,
+            prefetch_factor=2,       # ✅ Step 2
+            persistent_workers=True  # ✅ Step 2
+        )
 
 def get_val_loader(dataset, args):
     if args.is_parallel and _use_ddp():
